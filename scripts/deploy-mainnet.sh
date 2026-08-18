@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Production deploy. Safe by default: the upgrade authority is burned unless you
+# explicitly keep it.
+#
+# Why the default is burn: a live upgrade authority can replace the verifier
+# outright. That is strictly more power than swapping the verifying key, and it
+# makes every other guarantee in this program conditional on one key staying
+# uncompromised. The verifying key itself is write-once (Initialize is guarded by
+# `data_is_empty`, and no instruction mutates it), so keeping an upgrade
+# authority buys you nothing that the VK-in-account-data design does not already
+# give you.
+#
+#   KEEP_UPGRADE_AUTHORITY=1   keep it (must also set UPGRADE_AUTHORITY)
+#   CLUSTER=devnet             target cluster (default mainnet-beta)
+
+CLUSTER="${CLUSTER:-mainnet-beta}"
+KEEP="${KEEP_UPGRADE_AUTHORITY:-0}"
+SO=target/deploy/zkasper_solana_program.so
+
+[ -f "$SO" ] || { echo "build first: ./scripts/build.sh"; exit 1; }
+
+echo "cluster: $CLUSTER"
+if [ "$KEEP" = "1" ]; then
+  : "${UPGRADE_AUTHORITY:?set UPGRADE_AUTHORITY when KEEP_UPGRADE_AUTHORITY=1}"
+  echo "WARNING: keeping upgrade authority $UPGRADE_AUTHORITY"
+  echo "WARNING: that key can replace the verifier and forge any finalization."
+  echo "WARNING: use a multisig, never a single hot key."
+  read -r -p "type 'i accept' to continue: " ack
+  [ "$ack" = "i accept" ] || { echo "aborted"; exit 1; }
+  solana program deploy --url "$CLUSTER" --upgrade-authority "$UPGRADE_AUTHORITY" "$SO"
+else
+  echo "upgrade authority will be BURNED (immutable program)"
+  solana program deploy --url "$CLUSTER" --final "$SO"
+fi
+
+cat <<'NOTE'
+
+Before Initialize, confirm all of the following:
+
+1. The Groth16 verifying key and the Zisk `program_vk` are a MATCHED PAIR from
+   the same wrap. Nothing on chain checks this. A mismatched pair verifies
+   proofs of the wrong statement and fails open.
+2. The Groth16 trusted setup was a multi-party ceremony. A single-participant
+   setup means one party can forge any finalization, whatever this program does.
+3. The bootstrap checkpoint is a weak-subjectivity checkpoint you independently
+   verified, not one taken from an RPC you do not control.
+4. `Initialize` is first-come per authority. Run it in the same session as the
+   deploy so nobody else claims your PDA.
+NOTE

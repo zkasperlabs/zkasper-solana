@@ -142,6 +142,28 @@ old enough to be beyond weak subjectivity, and consumers must decide whether the
 trust that operator. This is why accounts are scoped by authority: a consumer
 names the light client it trusts, rather than reading whichever singleton exists.
 
+
+## Production defaults
+
+`scripts/deploy-mainnet.sh` deploys with the **upgrade authority burned**. That
+is the default because a live upgrade authority can replace the verifier
+outright, which is strictly more power than swapping the verifying key. Keeping
+it requires `KEEP_UPGRADE_AUTHORITY=1`, an explicit authority, and a typed
+confirmation.
+
+The verifying key lives in account data rather than the binary. This is
+deliberate and it is not a mutation path: `Initialize` is guarded by
+`data_is_empty`, no instruction writes `vk` or `program_vk` afterwards, and the
+account is a program-owned PDA. It is write-once. The benefit is that swapping
+fixture proofs for real ones needs no program upgrade — so the dangerous
+mechanism never has to be used.
+
+**Unchecked invariant.** `program_vk` (the Zisk guest identity) and the Groth16
+`vk` are supplied independently at `Initialize`, and nothing on chain verifies
+they came from the same wrap. A mismatched pair fails open: it verifies proofs
+of a statement nobody intended. Publish them as a pair and check them before
+bootstrapping.
+
 ### Known gap: `epoch-diff` does not prove succession
 
 **This is unfixed in zkasper today and it matters.**
