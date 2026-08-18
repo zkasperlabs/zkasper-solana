@@ -1,0 +1,25 @@
+[package]
+name = "zkasper-cli"
+description = "Command-line client for the zkasper Solana verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+zkasper-solana-program = { path = "../program", features = ["no-entrypoint"] }
+solana-client = "4"
+solana-commitment-config = "3"
+solana-instruction = "3"
+solana-keypair = "3"
+solana-message = "4"
+solana-pubkey = "4"
+solana-signer = "3"
+solana-transaction = "4"
+solana-compute-budget-interface = "3"
+hex = "0.4"
+
+# solana-reward-info 6.3 switched to wincode 0.6 while the rest of the pinned
+# agave 4.1 cluster is still on 0.5.
+solana-reward-info = "=6.2.0"

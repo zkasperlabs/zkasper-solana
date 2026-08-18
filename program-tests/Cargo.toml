@@ -1,0 +1,29 @@
+[package]
+name = "zkasper-program-tests"
+description = "LiteSVM integration tests for the zkasper Solana verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+zkasper-solana-program = { path = "../program", features = ["no-entrypoint"] }
+litesvm = "=0.15.2"
+solana-compute-budget-interface = "3"
+solana-instruction = "3"
+solana-keypair = "3"
+solana-message = "4"
+solana-pubkey = "4"
+solana-signer = "3"
+solana-transaction = "4"
+
+# litesvm 0.15.2 does not compile against agave 4.2.x: `ExecutionRecord` gained
+# fields in a point release. Pinning the runtime cluster to 4.1.2 keeps the
+# resolver on the set litesvm was built against.
+solana-builtins = "=4.1.2"
+solana-program-runtime = "=4.1.2"
+solana-transaction-context = "=4.1.2"

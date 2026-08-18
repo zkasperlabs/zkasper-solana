@@ -1,0 +1,26 @@
+[package]
+name = "zkasper-solana-program"
+description = "Solana on-chain verifier for zkasper Ethereum finality proofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+# Link the crate as a client-side library without pulling in the SBF entrypoint.
+no-entrypoint = []
+# Declared because `entrypoint!` tests for them; the defaults are used.
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+solana-program = "4"
+solana-system-interface = { version = "=3.2.0", features = ["std", "wincode"] }
+groth16-solana = "0.2.0"
+
+[dev-dependencies]
+hex = "0.4"
