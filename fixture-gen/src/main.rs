@@ -177,16 +177,26 @@ fn main() {
     // Epoch 300_001 keeps the bootstrap accumulator; 300_002 and 300_003 advance
     // it, so the tests cover both the steady-state and the accumulator-advance
     // branch of `submit_finalization`.
+    // A real chain: each finalization starts from the accumulator the previous
+    // one ended at. The program enforces this, so fixtures that did not chain
+    // would be rejected — which is the point of generating them this way.
     let outputs: Vec<FinalizationOutput> = (1..=3u64)
-        .map(|i| FinalizationOutput {
-            accumulator_commitment: if i == 1 {
+        .map(|i| {
+            let start = if i == 1 {
                 bootstrap_acc
             } else {
-                goldilocks_digest(&format!("accumulator after epoch {}", bootstrap_epoch + i))
-            },
-            finalized_epoch: bootstrap_epoch + i,
-            finalized_root: label(&format!("block root epoch {}", bootstrap_epoch + i)),
-            finalized_state_root: label(&format!("state root epoch {}", bootstrap_epoch + i)),
+                goldilocks_digest(&format!("accumulator after epoch {}", bootstrap_epoch + i - 1))
+            };
+            FinalizationOutput {
+                accumulator_commitment: start,
+                next_accumulator_commitment: goldilocks_digest(&format!(
+                    "accumulator after epoch {}",
+                    bootstrap_epoch + i
+                )),
+                finalized_epoch: bootstrap_epoch + i,
+                finalized_root: label(&format!("block root epoch {}", bootstrap_epoch + i)),
+                finalized_state_root: label(&format!("state root epoch {}", bootstrap_epoch + i)),
+            }
         })
         .collect();
 

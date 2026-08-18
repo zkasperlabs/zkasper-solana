@@ -25,6 +25,13 @@ pub enum ZkasperError {
     InvalidPublicInput = 12,
     InvalidVerifyingKey = 13,
     AccountDataTooSmall = 14,
+    /// The finalization starts from an accumulator this client does not hold.
+    ///
+    /// Each finalization names both ends of one proven epoch transition, so a
+    /// mismatch here means the proof belongs to a different accumulator chain —
+    /// a branch. Rejecting is what keeps the chain unbroken without the program
+    /// ever seeing an epoch-diff proof.
+    AccumulatorMismatch = 15,
 }
 
 impl From<ZkasperError> for ProgramError {

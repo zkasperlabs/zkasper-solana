@@ -21,7 +21,7 @@ pub const IX_ASSERT_ANCHORED: u8 = 3;
 pub const IX_VERIFY_ONLY: u8 = 4;
 
 pub const INITIALIZE_LEN: usize = 1 + 32 + 32 + 8 + 32 + 32 + VK_LEN;
-pub const SUBMIT_FINALIZATION_LEN: usize = 1 + 64 + 128 + 64 + 32 + 8 + 32 + 32;
+pub const SUBMIT_FINALIZATION_LEN: usize = 1 + 64 + 128 + 64 + 32 + 32 + 8 + 32 + 32;
 pub const ASSERT_FINALIZED_LEN: usize = 1 + 32 + 8 + 32;
 pub const ASSERT_ANCHORED_LEN: usize = 1 + 32 + 32;
 pub const VERIFY_ONLY_LEN: usize = SUBMIT_FINALIZATION_LEN;
@@ -130,9 +130,10 @@ impl<'a> ZkasperInstruction<'a> {
                 let proof_c = split(data, 193)?;
                 let output = FinalizationOutput {
                     accumulator_commitment: *split(data, 257)?,
-                    finalized_epoch: u64::from_le_bytes(*split::<8>(data, 289)?),
-                    finalized_root: *split(data, 297)?,
-                    finalized_state_root: *split(data, 329)?,
+                    next_accumulator_commitment: *split(data, 289)?,
+                    finalized_epoch: u64::from_le_bytes(*split::<8>(data, 321)?),
+                    finalized_root: *split(data, 329)?,
+                    finalized_state_root: *split(data, 361)?,
                 };
                 if *tag == IX_VERIFY_ONLY {
                     return Ok(Self::VerifyOnly {
@@ -226,6 +227,7 @@ pub fn submit_finalization(
     data.extend_from_slice(proof_b);
     data.extend_from_slice(proof_c);
     data.extend_from_slice(&output.accumulator_commitment);
+    data.extend_from_slice(&output.next_accumulator_commitment);
     data.extend_from_slice(&output.finalized_epoch.to_le_bytes());
     data.extend_from_slice(&output.finalized_root);
     data.extend_from_slice(&output.finalized_state_root);

@@ -14,7 +14,7 @@ use solana_program::hash::hashv;
 ///
 /// `PublicWriter` writes fixed-width little-endian fields with no framing:
 /// a 4-element Goldilocks digest (4 x u64 LE), a u64 LE, and two 32-byte roots.
-pub const FINALIZATION_PUBLIC_BYTES: usize = 32 + 8 + 32 + 32;
+pub const FINALIZATION_PUBLIC_BYTES: usize = 32 + 32 + 8 + 32 + 32;
 
 /// A zkasper accumulator digest: 4 Goldilocks elements, each little-endian.
 ///
@@ -28,7 +28,16 @@ pub type ProgramVk = [u8; 32];
 /// Public outputs of a zkasper finalization proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalizationOutput {
+    /// Accumulator that epoch E was justified against.
     pub accumulator_commitment: AccumulatorCommitment,
+    /// Accumulator that epoch E+1 was justified against, proven inside the
+    /// circuit to be the one above advanced by exactly the epoch diff E -> E+1.
+    ///
+    /// This is what lets the program chain finalizations without ever seeing an
+    /// epoch-diff proof: each finalization names both ends of one proven
+    /// transition, so requiring the incoming start to equal the stored
+    /// accumulator makes the chain unbroken by construction.
+    pub next_accumulator_commitment: AccumulatorCommitment,
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
     /// Beacon state root of the finalized block, opened from its header.
@@ -47,9 +56,10 @@ impl FinalizationOutput {
     pub fn public_bytes(&self) -> [u8; FINALIZATION_PUBLIC_BYTES] {
         let mut out = [0u8; FINALIZATION_PUBLIC_BYTES];
         out[0..32].copy_from_slice(&self.accumulator_commitment);
-        out[32..40].copy_from_slice(&self.finalized_epoch.to_le_bytes());
-        out[40..72].copy_from_slice(&self.finalized_root);
-        out[72..104].copy_from_slice(&self.finalized_state_root);
+        out[32..64].copy_from_slice(&self.next_accumulator_commitment);
+        out[64..72].copy_from_slice(&self.finalized_epoch.to_le_bytes());
+        out[72..104].copy_from_slice(&self.finalized_root);
+        out[104..136].copy_from_slice(&self.finalized_state_root);
         out
     }
 }
@@ -92,12 +102,17 @@ mod tests {
     #[test]
     fn public_bytes_matches_public_writer() {
         let commitment: [u64; 4] = [1, 2, 0xdead_beef_cafe_babe, u64::MAX];
-        let mut acc = [0u8; 32];
-        for (i, w) in commitment.iter().enumerate() {
-            acc[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
-        }
+        let next: [u64; 4] = [9, 8, 0x0123_4567_89ab_cdef, 42];
+        let digest = |w: &[u64; 4]| {
+            let mut b = [0u8; 32];
+            for (i, x) in w.iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
         let output = FinalizationOutput {
-            accumulator_commitment: acc,
+            accumulator_commitment: digest(&commitment),
+            next_accumulator_commitment: digest(&next),
             finalized_epoch: 372_105,
             finalized_root: [7u8; 32],
             finalized_state_root: [9u8; 32],
@@ -105,6 +120,9 @@ mod tests {
 
         let mut expected = Vec::new();
         for w in commitment.iter() {
+            expected.extend_from_slice(&w.to_le_bytes());
+        }
+        for w in next.iter() {
             expected.extend_from_slice(&w.to_le_bytes());
         }
         expected.extend_from_slice(&372_105u64.to_le_bytes());

@@ -75,9 +75,10 @@ fn finalization(i: usize) -> Finalization {
         c: buf[192..256].try_into().unwrap(),
         output: FinalizationOutput {
             accumulator_commitment: a32(buf, 256),
-            finalized_epoch: u64::from_le_bytes(buf[288..296].try_into().unwrap()),
-            finalized_root: a32(buf, 296),
-            finalized_state_root: a32(buf, 328),
+            next_accumulator_commitment: a32(buf, 288),
+            finalized_epoch: u64::from_le_bytes(buf[320..328].try_into().unwrap()),
+            finalized_root: a32(buf, 328),
+            finalized_state_root: a32(buf, 360),
         },
     }
 }
@@ -257,9 +258,11 @@ fn advances_through_three_finalizations() {
         assert_eq!(state.finalized_epoch, f.output.finalized_epoch);
         assert_eq!(state.finalized_root, f.output.finalized_root);
         assert_eq!(state.latest_state_root, f.output.finalized_state_root);
+        // Strict chaining: the state advances to the END of the proven
+        // transition, so the next finalization must start from here.
         assert_eq!(
             state.accumulator_commitment,
-            f.output.accumulator_commitment
+            f.output.next_accumulator_commitment
         );
         assert_eq!(state.submission_count as usize, i + 1);
 
@@ -279,11 +282,16 @@ fn advances_through_three_finalizations() {
         assert_eq!(anchor.finalized_epoch, f.output.finalized_epoch);
     }
 
-    // Fixture 0 reuses the bootstrap accumulator; 1 and 2 advance it. Both
-    // branches of `submit_finalization` are therefore covered.
+    // The fixtures form a chain: each finalization starts where the previous
+    // one ended. After three, the accumulator sits at the end of the third
+    // transition, one epoch past the last finalized epoch.
     assert_eq!(
         h.state().accumulator_epoch,
-        finalization(2).output.finalized_epoch
+        finalization(2).output.finalized_epoch + 1
+    );
+    assert_eq!(
+        h.state().accumulator_commitment,
+        finalization(2).output.next_accumulator_commitment
     );
     assert_ne!(h.state().accumulator_commitment, bootstrap_acc);
 }
@@ -519,4 +527,30 @@ fn behaviour_under_the_default_compute_budget() {
             e.err
         ),
     }
+}
+
+/// A finalization that does not start from the accumulator the client holds is
+/// a branch, and must be rejected rather than silently adopted.
+#[test]
+fn rejects_a_finalization_from_a_branched_accumulator() {
+    let mut h = Harness::new();
+    h.initialize();
+
+    let mut f = finalization(0);
+    // Same valid proof, but claim it starts somewhere the client has never been.
+    f.output.accumulator_commitment = [0xAB; 32];
+
+    let err = h
+        .submit(&f)
+        .expect_err("a finalization from an unknown accumulator must be rejected");
+    let logs = err.meta.pretty_logs();
+    assert!(
+        logs.contains("does not hold") || format!("{:?}", err.err).contains("Custom"),
+        "expected an accumulator mismatch, got: {}",
+        logs
+    );
+
+    // State must be untouched.
+    let state = h.state();
+    assert_eq!(state.submission_count, 0);
 }

@@ -118,9 +118,10 @@ fn main() {
             let blob = std::fs::read(&path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
             let output = FinalizationOutput {
                 accumulator_commitment: a32(&blob, 256),
-                finalized_epoch: u64::from_le_bytes(blob[288..296].try_into().unwrap()),
-                finalized_root: a32(&blob, 296),
-                finalized_state_root: a32(&blob, 328),
+                next_accumulator_commitment: a32(&blob, 288),
+                finalized_epoch: u64::from_le_bytes(blob[320..328].try_into().unwrap()),
+                finalized_root: a32(&blob, 328),
+                finalized_state_root: a32(&blob, 360),
             };
             println!("submitting epoch {}", output.finalized_epoch);
             send(

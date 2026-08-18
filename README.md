@@ -164,49 +164,27 @@ they came from the same wrap. A mismatched pair fails open: it verifies proofs
 of a statement nobody intended. Publish them as a pair and check them before
 bootstrapping.
 
-### Known gap: `epoch-diff` does not prove succession
+### Accumulator chaining
 
-**This is unfixed in zkasper today and it matters.**
+Each finalization proof names **both ends** of one proven epoch transition:
+`accumulator_commitment` (what epoch E was justified against) and
+`next_accumulator_commitment` (what E+1 was justified against, proven inside the
+circuit to be the first advanced by exactly the epoch diff E to E+1).
 
-zkasper's accumulator tracks the validator registry across epochs. The
-`epoch-diff` stage proves that a registry delta is consistent between two claimed
-beacon state roots — but it does **not** prove that the second state root is the
-canonical successor of the first. Nothing in that stage is tied to the chain.
+`submit_finalization` therefore requires the incoming start to equal the
+accumulator the client holds, and stores the end. The chain is unbroken by
+construction and the program never needs to see an epoch-diff proof. A prover
+who branched the accumulator cannot rejoin: the branch's commitment will not
+match what is stored, and the submission is rejected with
+`AccumulatorMismatch`.
 
-So a prover with no stake can fabricate a chain of `epoch-diff` proofs from the
-honest bootstrap state to an accumulator containing validators they invented, and
-then produce a perfectly valid finalization proof under it. The accumulator
-therefore advances **optimistically**. `submit_finalization` accepts a changed
-`accumulator_commitment` and says so in its logs; it cannot do better, because it
-never sees the `epoch-diff` chain.
+This replaced an earlier design that adopted any new commitment optimistically
+and left detection to the consumer.
 
-**The mitigation, which this program implements.** `finalized_state_root` is
-opened from the header of a block that two thirds of the stake attested to, so it
-names a real state root on the real chain — an attacker cannot produce one for a
-fabricated state without two thirds of the real validator set. Every accepted
-proof writes an `AnchorRecord` for its `finalized_state_root`.
-
-A consumer that follows an accumulator from state root A to state root B must
-require **every beacon state root the chain passed through to have an
-`AnchorRecord`**. A branched accumulator can never satisfy that, so it can never
-be confirmed. Query it with `AssertAnchored`, or by deriving
-`["zkasper-anchor", authority, state_root]` and reading the account.
-
-The same reasoning is written at the point where state advances, in
-[`program/src/processor.rs`](program/src/processor.rs).
-
-### Other properties
-
-* `finalized_epoch` must strictly increase; a replayed proof is rejected before
-  the pairing runs, for a few hundred units rather than ninety thousand.
-* `FinalizationRecord` accounts are write-once. There is no path that rewrites
-  one, so a consumer that has read a record can cache it forever.
-* PDAs are always derived with `find_program_address`. Accepting a client-supplied
-  bump would be cheaper by roughly 1,500 units per account, but it would let a
-  submitter place a record at a non-canonical address — advancing the state while
-  leaving the address consumers actually read empty. That trade is not worth it.
-* `submit_finalization` is permissionless. Anyone can pay to advance the light
-  client; the proof is the only thing that decides whether it advances.
+`AnchorRecord`s are still written per accepted proof, keyed by
+`finalized_state_root`. They remain useful to a consumer reasoning about which
+beacon states the accumulator passed through, but they are no longer the only
+thing standing between a branch and acceptance.
 
 ## Building and testing
 

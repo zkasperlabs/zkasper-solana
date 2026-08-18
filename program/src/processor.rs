@@ -211,26 +211,28 @@ fn submit_finalization(
         )?;
     }
 
-    // The proof is sound about Casper FFG under `output.accumulator_commitment`,
-    // but zkasper's `epoch-diff` stage proves only a registry delta between two
-    // claimed beacon state roots — never that the second root is the canonical
-    // successor of the first. So a new commitment is adopted OPTIMISTICALLY.
+    // Chain the accumulator strictly. Each finalization names BOTH ends of one
+    // proven transition: `accumulator_commitment` is what epoch E was justified
+    // against, and `next_accumulator_commitment` is what E+1 was justified
+    // against, proven inside the circuit to be the first advanced by exactly the
+    // epoch diff E -> E+1.
     //
-    // What makes that safe is the anchor record written below.
-    // `output.finalized_state_root` is opened from the header of a block that
-    // 2/3 of the stake attested to, so it names a real state root on the real
-    // chain. A consumer following an accumulator from A to B must require every
-    // beacon state root on that path to have an anchor record here; an attacker
-    // who branched the accumulator cannot produce one without 2/3 of the real
-    // validator set. See "Known gap" in the README.
+    // So the program never needs to see an epoch-diff proof to keep the chain
+    // unbroken: it requires the incoming start to equal the accumulator it holds,
+    // and stores the end. A prover who branched the accumulator cannot rejoin,
+    // because the branch's commitment will not match what is stored here.
+    //
+    // This replaces the earlier optimistic acceptance, which took any new
+    // commitment on trust and left detection to the consumer.
     if state.accumulator_commitment != output.accumulator_commitment {
-        state.accumulator_commitment = output.accumulator_commitment;
-        state.accumulator_epoch = output.finalized_epoch;
         msg!(
-            "zkasper accumulator advanced at epoch {}",
-            output.finalized_epoch
+            "zkasper: finalization starts from an accumulator this client does not hold"
         );
+        return Err(ZkasperError::AccumulatorMismatch.into());
     }
+    state.accumulator_commitment = output.next_accumulator_commitment;
+    state.accumulator_epoch = output.finalized_epoch + 1;
+
     state.latest_state_root = output.finalized_state_root;
     state.finalized_epoch = output.finalized_epoch;
     state.finalized_root = output.finalized_root;
