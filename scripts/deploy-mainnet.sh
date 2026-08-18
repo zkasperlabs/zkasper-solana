@@ -12,6 +12,12 @@ set -euo pipefail
 # authority buys you nothing that the VK-in-account-data design does not already
 # give you.
 #
+# Why you may still want to keep it: that argument assumes the verifier is
+# correct. This program has not been audited. Burning the authority on an
+# unaudited verifier makes every bug in it permanent — there is no patch, only a
+# redeploy at a new address that every consumer has to be told about. For a first
+# deployment, keep the authority under a multisig, and burn it after an audit.
+#
 #   KEEP_UPGRADE_AUTHORITY=1   keep it (must also set UPGRADE_AUTHORITY)
 #   CLUSTER=devnet             target cluster (default mainnet-beta)
 

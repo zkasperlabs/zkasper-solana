@@ -19,6 +19,7 @@ solana-signer = "3"
 solana-transaction = "4"
 solana-compute-budget-interface = "3"
 hex = "0.4"
+serde_json = "1"
 
 # solana-reward-info 6.3 switched to wincode 0.6 while the rest of the pinned
 # agave 4.1 cluster is still on 0.5.

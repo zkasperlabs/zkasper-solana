@@ -10,16 +10,25 @@
 //! zkasper-cli <rpc-url> <keypair.json> assert-finalized <epoch> <root-hex>
 //! zkasper-cli <rpc-url> <keypair.json> assert-anchored  <state-root-hex>
 //! ```
+//!
+//! `submit` also writes a *posting record* — the object `docs/api-v1.md` in the
+//! zkasper repository calls `posting` — to stdout, and appends it to the file
+//! named by `ZKASPER_POSTINGS` when that is set. That file is how the daemon
+//! learns a proof reached a chain, so the website can show the transaction
+//! rather than assert it.
 
 use std::process::exit;
 
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_request::RpcRequest;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+
+use serde_json::{json, Value};
 
 use zkasper_solana_program::instruction as ix;
 use zkasper_solana_program::state::{light_client_address, LightClientState, VK_LEN};
@@ -61,7 +70,7 @@ fn parse_root(s: &str) -> [u8; 32] {
         .unwrap_or_else(|_| die("expected 32 bytes"))
 }
 
-fn send(client: &RpcClient, payer: &Keypair, instruction: Instruction) {
+fn send(client: &RpcClient, payer: &Keypair, instruction: Instruction) -> String {
     let blockhash = client
         .get_latest_blockhash()
         .unwrap_or_else(|e| die(&e.to_string()));
@@ -75,8 +84,112 @@ fn send(client: &RpcClient, payer: &Keypair, instruction: Instruction) {
         blockhash,
     );
     match client.send_and_confirm_transaction(&tx) {
-        Ok(sig) => println!("ok {sig}"),
+        Ok(sig) => {
+            println!("ok {sig}");
+            sig.to_string()
+        }
         Err(e) => die(&e.to_string()),
+    }
+}
+
+/// Which Solana cluster the RPC is on, taken from its genesis hash rather than
+/// from the URL, so a posting cannot claim a chain it did not land on.
+fn cluster(client: &RpcClient) -> &'static str {
+    match client.get_genesis_hash().map(|h| h.to_string()).as_deref() {
+        Ok("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d") => "mainnet-beta",
+        Ok("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG") => "devnet",
+        Ok("4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY") => "testnet",
+        _ => "localnet",
+    }
+}
+
+/// The confirmed transaction, once the RPC will serve it. `send_and_confirm`
+/// returns before the ledger is queryable, so this polls.
+fn receipt(client: &RpcClient, signature: &str) -> Value {
+    for _ in 0..30 {
+        let result: Result<Value, _> = client.send(
+            RpcRequest::GetTransaction,
+            json!([
+                signature,
+                { "encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0 }
+            ]),
+        );
+        match result {
+            Ok(Value::Null) | Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+            Ok(value) => return value,
+        }
+    }
+    die(&format!("{signature} never became queryable"))
+}
+
+fn u64_at(value: &Value, path: &[&str]) -> u64 {
+    let mut node = value;
+    for key in path {
+        node = &node[key];
+    }
+    node.as_u64().unwrap_or_default()
+}
+
+/// What the submission cost and where it landed, as one line of JSON.
+///
+/// `fee_lamports` is the transaction fee. `rent_lamports` is what the payer
+/// left behind as the rent-exempt balance of the finalization and anchor
+/// records, which is the larger number and is not refundable — the program has
+/// no instruction that closes an account. Reporting only the fee would make the
+/// posting cheaper than it is.
+fn posting(client: &RpcClient, signature: &str, output: &FinalizationOutput) -> String {
+    let tx = receipt(client, signature);
+    let meta = &tx["meta"];
+    let fee = u64_at(meta, &["fee"]);
+    let spent = match (
+        meta["preBalances"][0].as_u64(),
+        meta["postBalances"][0].as_u64(),
+    ) {
+        (Some(pre), Some(post)) => pre.saturating_sub(post),
+        _ => fee,
+    };
+    let cluster = cluster(client);
+    let query = if cluster == "mainnet-beta" {
+        String::new()
+    } else {
+        format!("?cluster={cluster}")
+    };
+    json!({
+        "chain": format!("solana-{cluster}"),
+        "cluster": cluster,
+        "program": zkasper_solana_program::id().to_string(),
+        "epoch": output.finalized_epoch,
+        "finalized_root": format!("0x{}", hex::encode(output.finalized_root)),
+        "finalized_state_root": format!("0x{}", hex::encode(output.finalized_state_root)),
+        "signature": signature,
+        "slot": u64_at(&tx, &["slot"]),
+        "compute_units": u64_at(meta, &["computeUnitsConsumed"]),
+        "fee_lamports": fee,
+        "rent_lamports": spent.saturating_sub(fee),
+        "lamports_spent": spent,
+        "status": if meta["err"].is_null() { "confirmed" } else { "failed" },
+        "explorer": format!("https://explorer.solana.com/tx/{signature}{query}"),
+        "unix_millis": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
+    })
+    .to_string()
+}
+
+/// Prints the posting record, and appends it to `$ZKASPER_POSTINGS` when set.
+fn record_posting(line: &str) {
+    println!("{line}");
+    let Ok(path) = std::env::var("ZKASPER_POSTINGS") else {
+        return;
+    };
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()));
+    if let Err(e) = appended {
+        die(&format!("{path}: {e}"));
     }
 }
 
@@ -124,7 +237,7 @@ fn main() {
                 finalized_state_root: a32(&blob, 360),
             };
             println!("submitting epoch {}", output.finalized_epoch);
-            send(
+            let signature = send(
                 &client,
                 &payer,
                 ix::submit_finalization(
@@ -137,6 +250,7 @@ fn main() {
                     &output,
                 ),
             );
+            record_posting(&posting(&client, &signature, &output));
         }
         "show" => {
             let (address, _) = light_client_address(&program_id, &authority);

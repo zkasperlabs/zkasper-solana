@@ -7095,6 +7095,7 @@ name = "zkasper-cli"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "serde_json",
  "solana-client",
  "solana-commitment-config",
  "solana-compute-budget-interface",

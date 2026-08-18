@@ -7,6 +7,21 @@
 //! * `FinalizationOutput::public_bytes` — `crates/common/src/types.rs`
 //! * `PublicWriter`                     — `crates/common/src/recursion.rs`
 //! * `Digest = [u64; 4]`                — `crates/common/src/acc.rs`
+//!
+//! # Which proof this is
+//!
+//! zkasper has two pipelines and they publish different bytes. The batch
+//! pipeline's `FinalizationOutput` is the 136 bytes below. The streaming
+//! pipeline — the one `zkasperd` runs by default, and the only one on the
+//! latency path — publishes `StreamFinalOutput`, which is these same five
+//! fields followed by `justified_epoch` (u64) and `justified_root` (32 bytes):
+//! 176 bytes, a different SHA-256, a different public input, and therefore a
+//! proof this program rejects.
+//!
+//! That is not drift between the two repositories. It is a decision nobody has
+//! made yet: whether the wrap runs over the batch proof or the streaming one.
+//! Whichever it is, this module has to mirror **that** output, and the
+//! instruction has to carry its fields. Verify it before wrapping anything.
 
 use solana_program::hash::hashv;
 
@@ -40,7 +55,10 @@ pub struct FinalizationOutput {
     pub next_accumulator_commitment: AccumulatorCommitment,
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
-    /// Beacon state root of the finalized block, opened from its header.
+    /// Beacon state root at the first slot of the finalized epoch, opened out of
+    /// the justified checkpoint's `state_roots` rather than read off the
+    /// finalized block's header — so an epoch whose first slot is empty still
+    /// names the state the accumulator actually used.
     ///
     /// This is the retroactive anchor described in the README: `epoch-diff`
     /// proves a registry delta between two claimed state roots but not that the

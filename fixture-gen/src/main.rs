@@ -185,7 +185,10 @@ fn main() {
             let start = if i == 1 {
                 bootstrap_acc
             } else {
-                goldilocks_digest(&format!("accumulator after epoch {}", bootstrap_epoch + i - 1))
+                goldilocks_digest(&format!(
+                    "accumulator after epoch {}",
+                    bootstrap_epoch + i - 1
+                ))
             };
             FinalizationOutput {
                 accumulator_commitment: start,

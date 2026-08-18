@@ -36,6 +36,30 @@ instruction itself. Measured under LiteSVM against the compiled SBPF v3 program;
 reproduce with `./scripts/test.sh`, and see `measures_compute_units` in
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs).
 
+### What a submission costs in SOL
+
+Compute units are not the bill. Measured on a validator, one `submit_finalization`
+spends **2,872,520 lamports**, of which the transaction fee is **5,000** and the
+other **2,867,520** is rent-exempt balance left behind in the two accounts the
+program creates per finalization — 1,684,320 for the finalization record and
+1,183,200 for the anchor record.
+
+| | lamports | at $77/SOL |
+| --- | --- | --- |
+| transaction fee | 5,000 | $0.0004 |
+| rent for the two records | 2,867,520 | $0.22 |
+| **total per finalization** | **2,872,520** | **$0.22** |
+| `initialize`, once | 6,644,840 | $0.51 |
+| deploying the program | 597,397,240 | $46.11 |
+
+The rent is not refundable: no instruction closes an account, by design — the
+records *are* the read path, and a record that can be closed is a finality claim
+that can be withdrawn. Any quote of a per-proof cost that names only the fee is
+off by a factor of 574.
+
+Priority fees are on top and were zero for these accounts at the time of
+measurement; nothing here contends for a hot account.
+
 Published Groth16-on-Solana numbers are usually quoted as 170,000 to 500,000
 units. This lands well below that, for two reasons. The circuit exposes only two
 public inputs, so input preparation is two scalar multiplications rather than a
@@ -113,12 +137,20 @@ a valid proof from a *different* guest being accepted.
 | Offset | Length | Field |
 | --- | --- | --- |
 | 0 | 32 | `accumulator_commitment` — 4 Goldilocks elements, each `u64` little-endian |
-| 32 | 8 | `finalized_epoch` — `u64` little-endian |
-| 40 | 32 | `finalized_root` |
-| 72 | 32 | `finalized_state_root` |
+| 32 | 32 | `next_accumulator_commitment` — the same, after the epoch diff |
+| 64 | 8 | `finalized_epoch` — `u64` little-endian |
+| 72 | 32 | `finalized_root` |
+| 104 | 32 | `finalized_state_root` |
 
-That is 104 bytes, and it is produced by `PublicWriter` in
+That is 136 bytes, and it is produced by `PublicWriter` in
 `crates/common/src/recursion.rs`. If either side changes, proofs stop verifying.
+
+**This is the batch pipeline's output.** zkasper's streaming pipeline — what
+`zkasperd` runs by default — publishes `StreamFinalOutput` instead: the same
+136 bytes followed by `justified_epoch` (8) and `justified_root` (32), so 176
+bytes and a different `PI[1]`. A streaming proof will not verify against this
+program as it stands. Deciding which of the two the wrap runs over is item 1 of
+"Going live", and it has to be decided before a ceremony, not after.
 
 Proofs and keys use the EIP-197 encoding the `alt_bn128` syscalls expect: G1 is
 `x || y` as two 32-byte big-endian values, G2 is `x.c1 || x.c0 || y.c1 || y.c0`.
@@ -226,8 +258,15 @@ The program does not need to change. Everything below is something **zkasper**
 must produce.
 
 1. **Run the STARK-to-Groth16 wrap.** This is the blocking item. Zisk emits a
-   VADCOP final proof; something must wrap it into a BN254 Groth16 proof. Until
-   that exists, nothing else on this list can be tested.
+   VADCOP final proof of 262,144 bytes; something must wrap it into a BN254
+   Groth16 proof of 256. Until that exists, nothing else on this list can be
+   tested. The STARK itself never goes on chain — a whole submission is 393
+   bytes of instruction data (256 of proof, 136 of public output, one tag) in a
+   736-byte transaction.
+
+   Decide at the same time **which proof gets wrapped**, the batch pipeline's
+   `FinalizationOutput` or the streaming pipeline's `StreamFinalOutput`. They
+   commit to different bytes; see "The proof interface".
 
 2. **Make the wrap circuit expose exactly the two public inputs above.** Two
    inputs, in that order, each a sha256 with the top three bits cleared. Getting
@@ -263,6 +302,30 @@ Two smaller items worth doing at the same time: pin `groth16-solana` and the
 agave dependency versions once (this repository already pins several, because the
 4.1/4.2 point releases are not compatible), and decide who holds the bootstrap
 authority for the canonical instance.
+
+## Reporting a submission
+
+`zkasper-cli submit` prints a *posting record* — the `posting` object of
+`docs/api-v1.md` in the zkasper repository — and appends it to the file named by
+`ZKASPER_POSTINGS` when that is set:
+
+```sh
+ZKASPER_POSTINGS=/var/lib/zkasper/postings.jsonl \
+  zkasper-cli https://api.devnet.solana.com payer.json submit fixtures 0
+```
+
+```json
+{"chain":"solana-devnet","cluster":"devnet","epoch":300001,"signature":"4Jr…","slot":11,
+ "compute_units":99150,"fee_lamports":5000,"rent_lamports":2867520,"lamports_spent":2872520,
+ "status":"confirmed","explorer":"https://explorer.solana.com/tx/4Jr…?cluster=devnet","…":""}
+```
+
+`zkasperd --postings <path>` reads that file, publishes each new line as a
+`posting.landed` event and carries the recent ones in `status.json`, which is
+what lets the website show the transaction rather than assert it. The chain name
+comes from the cluster's genesis hash, so a posting cannot claim a chain it did
+not land on. The two processes share nothing but the file: the daemon never
+holds a key, and the submitter never holds the ingest token.
 
 ## License
 

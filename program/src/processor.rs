@@ -225,9 +225,7 @@ fn submit_finalization(
     // This replaces the earlier optimistic acceptance, which took any new
     // commitment on trust and left detection to the consumer.
     if state.accumulator_commitment != output.accumulator_commitment {
-        msg!(
-            "zkasper: finalization starts from an accumulator this client does not hold"
-        );
+        msg!("zkasper: finalization starts from an accumulator this client does not hold");
         return Err(ZkasperError::AccumulatorMismatch.into());
     }
     state.accumulator_commitment = output.next_accumulator_commitment;
