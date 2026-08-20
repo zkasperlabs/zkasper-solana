@@ -22,12 +22,12 @@ use zkasper_solana_program::error::ZkasperError;
 use zkasper_solana_program::instruction as ix;
 use zkasper_solana_program::plonk::PROOF_LEN;
 use zkasper_solana_program::state::{
-    anchor_record_address, finalization_record_address, light_client_address, AnchorRecord,
-    FinalizationRecord, LightClientState,
+    finalization_ring_address, light_client_address, FinalizationEntry, FinalizationRing,
+    LightClientState, RING_ENTRIES, RING_LEN,
 };
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// A whole submission measures 484,908 units; this leaves headroom without
+/// A whole submission measures 476,587 units; this leaves headroom without
 /// overpaying for a limit the runtime reserves block space against.
 const COMPUTE_UNIT_LIMIT: u32 = 700_000;
 
@@ -128,13 +128,8 @@ impl Harness {
     #[allow(clippy::result_large_err)]
     fn submit(&mut self, output: &FinalizationOutput) -> litesvm::types::TransactionResult {
         let compressed = self.f.compressed;
-        let instruction = ix::submit_finalization(
-            &self.program_id,
-            &self.payer.pubkey(),
-            &self.payer.pubkey(),
-            &compressed,
-            output,
-        );
+        let instruction =
+            ix::submit_finalization(&self.program_id, &self.payer.pubkey(), &compressed, output);
         self.send(&[instruction], Some(COMPUTE_UNIT_LIMIT))
     }
 
@@ -142,6 +137,34 @@ impl Harness {
         let (address, _) = light_client_address(&self.program_id, &self.payer.pubkey());
         LightClientState::unpack(&self.svm.get_account(&address).expect("state account").data)
             .expect("unpack state")
+    }
+
+    fn ring(&self) -> Vec<u8> {
+        let (address, _) = finalization_ring_address(&self.program_id, &self.payer.pubkey());
+        self.svm.get_account(&address).expect("ring account").data
+    }
+
+    /// Replace the ring with one holding `epochs`, so wrap-around can be tested
+    /// against a program that only has one real proof to advance it with.
+    fn seed_ring(&mut self, epochs: std::ops::Range<u64>) {
+        let (address, bump) = finalization_ring_address(&self.program_id, &self.payer.pubkey());
+        let mut account = self.svm.get_account(&address).expect("ring account");
+        let mut data = vec![0u8; RING_LEN];
+        FinalizationRing::init(&mut data, bump).unwrap();
+        for epoch in epochs {
+            FinalizationRing::write(&mut data, &seeded(epoch)).unwrap();
+        }
+        account.data = data;
+        self.svm.set_account(address, account).unwrap();
+    }
+}
+
+/// A distinguishable entry per epoch, for the seeded-ring tests.
+fn seeded(epoch: u64) -> FinalizationEntry {
+    FinalizationEntry {
+        finalized_epoch: epoch,
+        finalized_root: [epoch as u8; 32],
+        finalized_state_root: [!(epoch as u8); 32],
     }
 }
 
@@ -178,6 +201,17 @@ fn bootstrap_writes_the_trusted_checkpoint() {
     // checkpoint, so it is labelled with that epoch -- which is exactly the
     // `finalized_epoch` the first accepted proof must carry.
     assert_eq!(state.accumulator_epoch, h.f.output.finalized_epoch);
+
+    // The ring is allocated here and nowhere else. Every slot is empty, and an
+    // empty slot answers for no epoch at all.
+    let ring = h.ring();
+    assert_eq!(ring.len(), RING_LEN);
+    for epoch in 0..RING_ENTRIES as u64 {
+        assert_eq!(
+            FinalizationRing::entry(&ring, epoch),
+            Err(ZkasperError::EpochNotInRing)
+        );
+    }
 }
 
 #[test]
@@ -224,19 +258,15 @@ fn a_wrapped_proof_advances_the_light_client() {
     );
     assert_eq!(state.accumulator_epoch, out.justified_epoch);
 
-    let (record_address, _) =
-        finalization_record_address(&h.program_id, &h.payer.pubkey(), out.finalized_epoch);
-    let record =
-        FinalizationRecord::unpack(&h.svm.get_account(&record_address).unwrap().data).unwrap();
-    assert_eq!(record.finalized_epoch, out.finalized_epoch);
-    assert_eq!(record.finalized_root, out.finalized_root);
-    assert_eq!(record.accumulator_commitment, out.accumulator_commitment);
-
-    let (anchor_address, _) =
-        anchor_record_address(&h.program_id, &h.payer.pubkey(), &out.finalized_state_root);
-    let anchor = AnchorRecord::unpack(&h.svm.get_account(&anchor_address).unwrap().data).unwrap();
-    assert_eq!(anchor.finalized_state_root, out.finalized_state_root);
-    assert_eq!(anchor.finalized_epoch, out.finalized_epoch);
+    let ring = h.ring();
+    let entry = FinalizationRing::entry(&ring, out.finalized_epoch).unwrap();
+    assert_eq!(entry.finalized_root, out.finalized_root);
+    assert_eq!(entry.finalized_state_root, out.finalized_state_root);
+    // The same entry, reached the other way: by the state root it named.
+    assert_eq!(
+        FinalizationRing::entry_by_state_root(&ring, &out.finalized_state_root),
+        Ok(entry)
+    );
 }
 
 #[test]
@@ -328,12 +358,10 @@ fn rejects_a_finalization_that_skips_an_epoch() {
     assert_eq!(after.finalized_epoch, out.finalized_epoch - 2);
     assert_eq!(after.accumulator_epoch, out.finalized_epoch - 1);
     assert_eq!(after.submission_count, 0);
-    assert!(h
-        .svm
-        .get_account(
-            &finalization_record_address(&h.program_id, &h.payer.pubkey(), out.finalized_epoch).0
-        )
-        .is_none_or(|a| a.data.is_empty()));
+    assert_eq!(
+        FinalizationRing::entry(&h.ring(), out.finalized_epoch),
+        Err(ZkasperError::EpochNotInRing)
+    );
 }
 
 /// The same proof, under a light client that pins a different guest key. The
@@ -360,13 +388,7 @@ fn rejects_a_commitment_that_does_not_decompress() {
     let mut proof = h.f.compressed;
     proof[..32].copy_from_slice(&[0xff; 32]);
     let result = h.send(
-        &[ix::submit_finalization(
-            &h.program_id,
-            &payer,
-            &payer,
-            &proof,
-            &out,
-        )],
+        &[ix::submit_finalization(&h.program_id, &payer, &proof, &out)],
         Some(COMPUTE_UNIT_LIMIT),
     );
     custom_error(&result, ZkasperError::ProofVerificationFailed);
@@ -383,39 +405,34 @@ fn rejects_a_commitment_with_the_sign_bit_flipped() {
     let mut proof = h.f.compressed;
     proof[0] ^= 0x80;
     let result = h.send(
-        &[ix::submit_finalization(
-            &h.program_id,
-            &payer,
-            &payer,
-            &proof,
-            &out,
-        )],
+        &[ix::submit_finalization(&h.program_id, &payer, &proof, &out)],
         Some(COMPUTE_UNIT_LIMIT),
     );
     custom_error(&result, ZkasperError::ProofVerificationFailed);
 }
 
-/// Every address this program creates is derivable in advance, and
-/// `create_account` refuses an address that already holds lamports. Funding one
-/// ahead of a submission must not be able to block it.
+/// Both addresses this program creates are derivable before anyone bootstraps,
+/// and `create_account` refuses an address that already holds lamports. Funding
+/// one ahead of `initialize` must not be able to block it.
 ///
 /// The runtime will not let a transaction leave an account rent-paying, so the
 /// cheapest such grief is the rent-exempt minimum of an empty account —
-/// 890,880 lamports, and it has to be spent per address. With the allocate path
-/// below it buys nothing at all: the lamports are absorbed into the account the
-/// program then creates, so the griefer pays part of the submitter's rent.
+/// 890,880 lamports. With the allocate path below it buys nothing at all: the
+/// lamports are absorbed into the account the program then creates, so the
+/// griefer pays part of the authority's rent. It is now one shot per light
+/// client rather than one per epoch, and the ring is the expensive half.
 #[test]
 fn survives_addresses_funded_in_advance() {
     let mut h = Harness::new();
-    h.initialize();
-    let out = h.f.output;
     let payer = h.payer.pubkey();
     for address in [
-        finalization_record_address(&h.program_id, &payer, out.finalized_epoch).0,
-        anchor_record_address(&h.program_id, &payer, &out.finalized_state_root).0,
+        light_client_address(&h.program_id, &payer).0,
+        finalization_ring_address(&h.program_id, &payer).0,
     ] {
         h.svm.airdrop(&address, 890_880).unwrap();
     }
+    h.initialize();
+    let out = h.f.output;
     h.submit(&out)
         .expect("a funded address blocked the submission");
     assert_eq!(h.state().finalized_epoch, out.finalized_epoch);
@@ -460,13 +477,116 @@ fn read_path_answers_finalization_and_anchor_queries() {
 
     let mut unknown = out.finalized_state_root;
     unknown[0] ^= 1;
-    // The PDA for a state root nothing anchored does not exist, so the runtime
-    // hands the program an empty account the system program owns.
+    // A state root nothing anchored is a full pass over the ring that finds
+    // nothing, rather than an account that does not exist.
     let result = h.send(
         &[ix::assert_anchored(&h.program_id, &authority, &unknown)],
         Some(COMPUTE_UNIT_LIMIT),
     );
     custom_error(&result, ZkasperError::StateRootNotAnchored);
+}
+
+/// What a ring gives up, asserted on chain rather than described.
+///
+/// The ring holds 128 epochs. Ask it about the epoch one step beyond that and
+/// the slot answers with a different epoch — the check that turns an index into
+/// a hit is the equality on the stored epoch, and this is the case that proves
+/// it fires. The error says the claim is no longer stored, which is not the
+/// error for "this checkpoint was not finalized"; a consumer that cannot tell
+/// them apart cannot tell "wait" from "reject".
+///
+/// The ring is seeded directly because advancing a light client 129 epochs
+/// would take 129 wrapped proofs and only one exists.
+#[test]
+fn an_epoch_older_than_the_window_is_gone_and_says_so() {
+    let mut h = Harness::new();
+    h.initialize();
+    let authority = h.payer.pubkey();
+    let head = 500_000;
+    let oldest = head + 1 - RING_ENTRIES as u64;
+    h.seed_ring(oldest..head + 1);
+
+    for epoch in [oldest, head] {
+        h.ok(&[ix::assert_finalized(
+            &h.program_id,
+            &authority,
+            epoch,
+            &seeded(epoch).finalized_root,
+        )]);
+    }
+
+    // One epoch further back. It shares a slot with the head, which overwrote
+    // it, so what is there is a real finalization of a real epoch -- just not
+    // this one. The wrong root is not what gets reported, because the epoch
+    // never matched in the first place.
+    let aged_out = oldest - 1;
+    assert_eq!(
+        aged_out % RING_ENTRIES as u64,
+        head % RING_ENTRIES as u64,
+        "the aged-out epoch must collide with the head to test what it is meant to"
+    );
+    let result = h.send(
+        &[ix::assert_finalized(
+            &h.program_id,
+            &authority,
+            aged_out,
+            &seeded(aged_out).finalized_root,
+        )],
+        Some(COMPUTE_UNIT_LIMIT),
+    );
+    custom_error(&result, ZkasperError::EpochNotInRing);
+
+    // The state root it named is gone with it.
+    let result = h.send(
+        &[ix::assert_anchored(
+            &h.program_id,
+            &authority,
+            &seeded(aged_out).finalized_state_root,
+        )],
+        Some(COMPUTE_UNIT_LIMIT),
+    );
+    custom_error(&result, ZkasperError::StateRootNotAnchored);
+}
+
+/// A ring is not believed because it is a ring. It has to be *this* authority's.
+///
+/// The account handed over below is well formed, program-owned, and holds
+/// exactly the claim the caller wants proved — it is simply derived from an
+/// authority the caller chose. The bump the header names is the one that
+/// derives it, so the only thing standing in the way is that the derivation
+/// runs against the authority the *instruction* names.
+#[test]
+fn a_ring_that_belongs_to_another_authority_is_rejected() {
+    let mut h = Harness::new();
+    h.initialize();
+    let out = h.f.output;
+    h.submit(&out).unwrap();
+
+    let forged = Pubkey::new_from_array([9u8; 32]);
+    let (address, bump) = finalization_ring_address(&h.program_id, &forged);
+    let mut data = vec![0u8; RING_LEN];
+    FinalizationRing::init(&mut data, bump).unwrap();
+    FinalizationRing::write(&mut data, &seeded(1)).unwrap();
+    let (real, _) = finalization_ring_address(&h.program_id, &h.payer.pubkey());
+    let mut account = h.svm.get_account(&real).unwrap();
+    account.data = data;
+    h.svm.set_account(address, account).unwrap();
+
+    // Proof that the substitution is otherwise perfect: the same instruction
+    // naming the authority that ring belongs to passes.
+    let mut instruction =
+        ix::assert_finalized(&h.program_id, &forged, 1, &seeded(1).finalized_root);
+    h.ok(&[instruction.clone()]);
+
+    instruction = ix::assert_finalized(
+        &h.program_id,
+        &h.payer.pubkey(),
+        1,
+        &seeded(1).finalized_root,
+    );
+    instruction.accounts[0].pubkey = address;
+    let result = h.send(&[instruction], Some(COMPUTE_UNIT_LIMIT));
+    custom_error(&result, ZkasperError::InvalidRingAccount);
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +626,49 @@ fn measures_compute_units() {
         .unwrap()
         .compute_units_consumed;
 
+    // The state-root lookup is a scan, so it is measured against a full ring and
+    // at both ends of it: the entry it wants sitting in the last slot it
+    // reaches, and a state root nothing anchored, which reaches every slot.
+    let head = 500_000;
+    h.seed_ring(head + 1 - RING_ENTRIES as u64..head + 1);
+    let authority = h.payer.pubkey();
+    let last = (head + 1 - RING_ENTRIES as u64..=head)
+        .find(|epoch| epoch % RING_ENTRIES as u64 == RING_ENTRIES as u64 - 1)
+        .expect("a full ring covers every slot");
+    let indexed = h
+        .send(
+            &[ix::assert_finalized(
+                &h.program_id,
+                &authority,
+                head,
+                &seeded(head).finalized_root,
+            )],
+            Some(COMPUTE_UNIT_LIMIT),
+        )
+        .unwrap()
+        .compute_units_consumed;
+    let scan_hit = h
+        .send(
+            &[ix::assert_anchored(
+                &h.program_id,
+                &authority,
+                &seeded(last).finalized_state_root,
+            )],
+            Some(COMPUTE_UNIT_LIMIT),
+        )
+        .unwrap()
+        .compute_units_consumed;
+    let mut unknown = seeded(last).finalized_state_root;
+    unknown[0] ^= 1;
+    let scan_miss = h
+        .send(
+            &[ix::assert_anchored(&h.program_id, &authority, &unknown)],
+            Some(COMPUTE_UNIT_LIMIT),
+        )
+        .unwrap_err()
+        .meta
+        .compute_units_consumed;
+
     // Each transaction also runs one ComputeBudget instruction, which the
     // runtime charges 150 units for.
     println!("compute units (whole transaction, includes 150 for ComputeBudget)");
@@ -513,6 +676,9 @@ fn measures_compute_units() {
     println!("  verify_only           {verify_only:>7}");
     println!("  submit_finalization   {submit:>7}");
     println!("  assert_finalized      {read:>7}");
+    println!("  full ring, by epoch   {indexed:>7}");
+    println!("  full ring, by state root, last slot  {scan_hit:>7}");
+    println!("  full ring, by state root, no match   {scan_miss:>7}");
     // Solana's published syscall prices: eighteen scalar multiplications,
     // eighteen point additions, one pairing of two pairs, and the nine G1
     // decompressions the compressed proof adds, each 398 over the 100-unit
@@ -530,12 +696,24 @@ fn measures_compute_units() {
         "a submission no longer fits the budget it asks for: {submit}"
     );
     assert!(read < 10_000, "read path cost regressed: {read}");
+    // Indexing does not care how full the ring is.
+    assert_eq!(indexed, read, "the by-epoch lookup is no longer O(1)");
+    // A linear pass over 128 entries has to stay small against the 476,587 a
+    // submission costs, or the reverse index was not worth removing. The
+    // comparison stops at the first 8-byte word that differs, and 128 beacon
+    // state roots that agree past one would be a SHA-256 collision, so this is
+    // the cost and not a best case.
+    assert!(
+        scan_miss < 10_000,
+        "the state-root scan cost regressed: {scan_miss}"
+    );
 }
 
 /// What a submission leaves behind, in lamports.
 ///
-/// Compute units are not the bill. Rent is, and all of it is permanent now that
-/// nothing is staged: the two records are what a submitter pays for.
+/// Compute units are not the bill; rent is. It is now paid once, at bootstrap,
+/// for the ring — a submission creates no account and leaves nothing behind, so
+/// what it costs is the transaction fee and that is all.
 #[test]
 fn measures_lamports() {
     let mut h = Harness::new();
@@ -546,33 +724,34 @@ fn measures_lamports() {
     let out = h.f.output;
     h.submit(&out).unwrap();
     let after_submit = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
-    let record = h
-        .svm
-        .get_account(
-            &finalization_record_address(&h.program_id, &h.payer.pubkey(), out.finalized_epoch).0,
-        )
-        .unwrap()
-        .lamports;
-    let anchor = h
-        .svm
-        .get_account(
-            &anchor_record_address(&h.program_id, &h.payer.pubkey(), &out.finalized_state_root).0,
-        )
-        .unwrap()
-        .lamports;
+
+    let (ring_address, _) = finalization_ring_address(&h.program_id, &h.payer.pubkey());
+    let ring = h.svm.get_account(&ring_address).unwrap().lamports;
+    let submission = after_init - after_submit;
 
     println!("\nlamports");
     println!(
         "  initialize, once          {:>10}",
         before_init - after_init
     );
+    println!("    finalization ring       {ring:>10}  {RING_LEN} bytes, {RING_ENTRIES} epochs");
+    println!("  submit_finalization       {submission:>10}");
     println!(
-        "  submit_finalization       {:>10}",
-        after_init - after_submit
+        "    rent left behind        {:>10}",
+        submission.saturating_sub(FEE)
     );
-    println!("    finalization record     {record:>10}");
-    println!("    anchor record           {anchor:>10}");
+
+    // The point of the ring: a submission is a fee and nothing else. The
+    // per-epoch records this replaced cost 2,867,520 lamports of rent that
+    // nobody could ever reclaim.
+    assert_eq!(
+        submission, FEE,
+        "a submission is paying rent again: {submission}"
+    );
 }
+
+/// What LiteSVM charges for a one-signature transaction.
+const FEE: u64 = 5_000;
 
 /// A transaction with no `ComputeBudgetProgram` instruction gets 200,000 units.
 #[test]
@@ -581,13 +760,7 @@ fn behaviour_under_the_default_compute_budget() {
     h.initialize();
     let out = h.f.output;
     let compressed = h.f.compressed;
-    let instruction = ix::submit_finalization(
-        &h.program_id,
-        &h.payer.pubkey(),
-        &h.payer.pubkey(),
-        &compressed,
-        &out,
-    );
+    let instruction = ix::submit_finalization(&h.program_id, &h.payer.pubkey(), &compressed, &out);
     match h.send(&[instruction], None) {
         Ok(meta) => panic!(
             "a PLONK submission now fits the 200,000-unit default at {} units; the \
@@ -610,14 +783,18 @@ fn size(tx: &Transaction) -> u64 {
     bincode::serialized_size(tx).unwrap()
 }
 
-/// The one transaction a submission takes, and the uncompressed encoding that
-/// does not fit.
+/// The one transaction a submission takes, and how little room the uncompressed
+/// encoding has.
 ///
-/// A PLONK proof is 768 bytes and a Solana packet is 1,232. Carried whole beside
-/// the 176-byte output and the accounts the instruction names, a submission
-/// overruns the packet. Each of the nine G1 commitments is an `(x, y)` pair that
-/// `x` and one sign bit determine, so sending only `x` takes 288 bytes off and
-/// brings the whole thing inside the limit with room to spare.
+/// A PLONK proof is 768 bytes and a Solana packet is 1,232. Each of the nine G1
+/// commitments is an `(x, y)` pair that `x` and one sign bit determine, so
+/// sending only `x` takes 288 bytes off.
+///
+/// It used to be 288 bytes or nothing: with the two per-epoch accounts named in
+/// the instruction, an uncompressed submission was 1,288 bytes and did not fit.
+/// The ring removed both, and 67 bytes of keys and indices with them, so an
+/// uncompressed proof would now fit — by eleven bytes. Eleven bytes is not a
+/// margin, and the test below says why in the terms that will spend it.
 #[test]
 fn what_a_submission_weighs() {
     let mut h = Harness::new();
@@ -625,7 +802,7 @@ fn what_a_submission_weighs() {
 
     let out = h.f.output;
     let payer = h.payer.pubkey();
-    let instruction = ix::submit_finalization(&h.program_id, &payer, &payer, &h.f.compressed, &out);
+    let instruction = ix::submit_finalization(&h.program_id, &payer, &h.f.compressed, &out);
     let submit = h.transaction(std::slice::from_ref(&instruction), Some(COMPUTE_UNIT_LIMIT));
 
     // The size is of a transaction that already carries the budget raise: the
@@ -669,10 +846,18 @@ fn what_a_submission_weighs() {
         "a submission no longer fits one packet: {}",
         size(&submit)
     );
+    // `GUEST_COMMITS_PROGRAM_VK` is the next 32 bytes zkasper will commit, and
+    // the instruction carries the committed output verbatim. Uncompressed, that
+    // is a submission that stops fitting; compressed, it is 288 bytes of slack
+    // that never has to be found again.
     assert!(
-        size(&uncompressed) > PACKET_LIMIT,
-        "an uncompressed proof now fits a packet; compression is no longer what makes \
-         this one transaction"
+        size(&uncompressed) + 32 > PACKET_LIMIT,
+        "an uncompressed proof now has room for the guest key too; compression has \
+         stopped being what keeps a submission in one packet"
+    );
+    assert!(
+        size(&submit) + 288 == size(&uncompressed),
+        "compression is no longer worth 288 bytes"
     );
 }
 

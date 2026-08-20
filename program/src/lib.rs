@@ -10,9 +10,13 @@
 //! and brings the submission to 480 bytes of proof, so `SubmitFinalization`
 //! carries it inline and a submission is one transaction.
 //!
+//! Accepted finalizations go into [`state::FinalizationRing`], one account of
+//! 128 slots written in place, so history costs a fixed rent once instead of an
+//! account an epoch forever. It holds about 13.6 hours; a consumer that may be
+//! asked about something older has to say so.
+//!
 //! See the README for the trust model, and in particular for the `epoch-diff`
-//! successor gap that makes the anchor records in [`state::AnchorRecord`] load
-//! bearing.
+//! successor gap that makes the state roots the ring records load bearing.
 
 pub mod error;
 pub mod instruction;

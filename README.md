@@ -27,10 +27,9 @@ replaced by the matching syscall.
 ## One transaction
 
 A PLONK proof is 768 bytes. The finalization output it attests to is another 176,
-and the envelope around them — a signature, a blockhash, and six account keys:
-payer, state, record, anchor, system program, this program and `ComputeBudget` —
-is the rest. Sent whole, that is **1,288 bytes against Solana's 1,232-byte packet
-limit**, and a submission does not fit.
+and the envelope around them — a signature, a blockhash, and five account keys:
+the fee payer, the state, the ring, this program and `ComputeBudget` — is the
+rest.
 
 Nine of the proof's twenty-four words are not scalars but the `x` halves of nine
 G1 commitments, and a BN254 point is determined by `x` and one sign bit. So the
@@ -40,12 +39,23 @@ expands it with `alt_bn128_g1_decompress` — a syscall live on mainnet since sl
 
 | | bytes | |
 | --- | --- | --- |
-| one transaction, proof sent whole | 1,288 | over |
-| **one transaction, nine commitments compressed** | **1,000** | **fits, 232 spare** |
+| one transaction, proof sent whole | 1,221 | fits, 11 spare |
+| **one transaction, nine commitments compressed** | **933** | **fits, 299 spare** |
 
 Measured, not modelled — `what_a_submission_weighs` in
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs) serializes
 both.
+
+**This used to be 288 bytes or nothing.** With a finalization record and an
+anchor record named in the instruction, an uncompressed submission was 1,288
+bytes and did not fit the 1,232-byte packet; compression was the only thing
+making a submission one transaction. The ring removed both accounts and 67 bytes
+of keys and account indices with them, so an uncompressed proof now fits — by
+eleven bytes. It stays compressed anyway, and not out of habit: eleven bytes is
+not a margin, and `GUEST_COMMITS_PROGRAM_VK` (below) adds 32 bytes to the
+committed output the instruction carries verbatim, which puts the uncompressed
+form back over the limit. The test asserts that margin rather than the old
+inequality.
 
 The instruction data is 657 bytes: one tag, 480 of compressed proof, 176 of
 output. Nothing is staged, so there is no buffer account, no second signature and
@@ -64,16 +74,35 @@ membership.
 
 ## Measured cost
 
-A submission costs **484,908 compute units**, which does **not** fit Solana's
+A submission costs **476,587 compute units**, which does **not** fit Solana's
 200,000-unit default: every submitter must raise the limit with
 `ComputeBudgetProgram`. 700,000 is the value the CLI asks for.
 
 | Path | Compute units |
 | --- | --- |
-| `submit_finalization` — decompress, verify, advance state, write two records | **484,908** |
-| `verify_only` — decompression and PLONK verification alone | 472,531 |
-| `assert_finalized` / `assert_anchored` — read path | 3,728 |
-| `initialize` — trusted bootstrap | 6,874 |
+| `submit_finalization` — decompress, verify, advance state, write one ring entry | **476,587** |
+| `verify_only` — decompression and PLONK verification alone | 472,530 |
+| `assert_finalized` — index the ring by epoch, on a full ring | 2,412 |
+| `assert_anchored` — a pass over all 128 entries, no match | 3,181 |
+| `assert_anchored` — the same, matching in the last slot reached | 3,337 |
+| `initialize` — trusted bootstrap, and the ring's one allocation | 10,788 |
+
+The by-epoch lookup does not read the ring's other 127 entries, so it costs the
+same whether the ring is empty or full, and it is *cheaper* than the per-epoch
+account it replaced: one `create_program_address` against the bump the ring
+stores, instead of a `find_program_address` walk for an address derived from the
+epoch.
+
+The by-state-root lookup is a linear pass, because the ring has no reverse index
+— that index used to be an account per state root. The pass costs 769 units more
+than indexing by epoch, and still less than the 3,728 the old lookup measured,
+which had to walk `find_program_address` over a seed containing the state root
+before it could load anything. A comparison stops at the first 8-byte word that
+differs, and 128 beacon state roots agreeing past one would be a SHA-256
+collision, so 3,181 is the cost and not a lucky case. Unpacking every slot to
+compare it, rather than comparing in place, measured 23,662 — which is why the
+scan reads the 32 bytes it needs and materialises an entry only once it has
+found one.
 
 Nine G1 decompressions are 4,878 of that, measured marginally — 542 each, of
 which 498 is the syscall (a 100-unit base plus the 398 the table quotes) and the
@@ -82,6 +111,11 @@ two-transaction design's 481,005: dropping the buffer also drops an account load
 and a `find_program_address` walk, so the net cost of going compressed and
 single-transaction is 3,903 units.
 
+The ring took another **8,321** off. A submission no longer runs two
+`find_program_address` walks, two `create_account` invocations of the system
+program or a `Clock` read, and names two fewer accounts; it writes 73 bytes into
+an account that already exists.
+
 Whole-transaction figures, each including 150 units for the `ComputeBudget`
 instruction itself. Measured under LiteSVM with mainnet's feature set, against
 the compiled SBPF v3 program running the real wrapped proof; reproduce with
@@ -89,10 +123,13 @@ the compiled SBPF v3 program running the real wrapped proof; reproduce with
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs).
 
 The same submission on a real `solana-test-validator` — `./scripts/demo.sh`,
-which generates a fresh payer each run — costs a little more. The gap is bump
-seeds: `find_program_address` walks downwards from 255 at 1,500 units an attempt,
-and a different authority lands on different bumps for its PDAs. Budget for the
-variance rather than for the measurement.
+which generates a fresh payer each run — costs **476,587**, to the unit. It used
+to cost a little more than the measurement, and the gap was bump seeds:
+`find_program_address` walks downwards from 255 at 1,500 units an attempt, and a
+different authority lands on different bumps for its PDAs. A submission no longer
+runs that walk for anything — the state and the ring each name the bump they were
+derived under — so the number is the same for every authority. `initialize` still
+walks, and still varies.
 
 Where it goes, from `cargo test -p zkasper-plonk-cost -- --nocapture`, which
 prices each piece in its own transaction:
@@ -119,24 +156,70 @@ comes back "unsupported BPF instruction" even with mainnet's feature set active.
 
 ### What a submission costs in SOL
 
-Compute units are not the bill. A submission spends **2,872,520 lamports**,
-almost all of it rent-exempt balance left behind in the two accounts the program
-creates per finalization.
+Compute units are not the bill. Rent was, and a submission now leaves none
+behind: the finalization goes into a ring account that `initialize` paid for
+once, written over the epoch 128 places back.
 
 | | lamports | at $77/SOL |
 | --- | --- | --- |
 | one transaction fee | 5,000 | $0.0004 |
-| rent for the two records | 2,867,520 | $0.22 |
-| **total per finalization** | **2,872,520** | **$0.22** |
-| `initialize`, once | 2,190,440 | $0.17 |
+| rent left behind | 0 | $0 |
+| **total per finalization** | **5,000** | **$0.0004** |
+| `initialize`, once — state and ring | 68,129,480 | $5.25 |
+| of which the ring, 9,346 bytes | 65,939,040 | $5.08 |
 | deploying the program | ~600,000,000 | ~$46 |
 
-Measured, from `measures_lamports` in the same test file. The record rent is not
-refundable, by design — the records *are* the read path, and a record that can be
-closed is a finality claim that can be withdrawn.
+Measured, from `measures_lamports` in the same test file, which now asserts that
+a submission costs the fee and nothing more.
+
+**What this replaced.** Each finalization used to create two accounts that were
+deliberately never closed: a 114-byte record keyed by epoch and a 42-byte anchor
+keyed by state root. Rent is charged on `128 + data_len` bytes, so the pair
+billed 412 bytes — 2,867,520 lamports, or $0.22 — and an epoch is 6.4 minutes, so
+that is 225 pairs a day. About 235 SOL a year, roughly $18,100, of which some
+three quarters was addressing and account overhead rather than finality data. The
+ring pays for itself after **23 epochs, about two and a half hours**, and the
+recurring cost after that is the transaction fee: about $2.60 a month.
 
 Priority fees are on top and were zero for these accounts at the time of
 measurement; nothing here contends for a hot account.
+
+### What the ring gives up, and how to check before relying on it
+
+The old records were non-closeable, and the reason given was that a record which
+can be closed is a finality claim that can be withdrawn. That argument is right
+about *closeable* accounts and it does not carry over here, because nothing in
+this design chooses which claim disappears. What it buys instead has to be said
+plainly:
+
+**A finalization older than 128 epochs — 13.6 hours — is no longer on chain.**
+No read path can answer for it. `AssertFinalized` fails with `EpochNotInRing`
+and `AssertAnchored` with `StateRootNotAnchored`, and a consumer that reads the
+ring account directly finds the slot holding a different epoch.
+
+Three things make that a schedule rather than a withdrawal. Entries age out in
+epoch order, at a rate fixed by `RING_ENTRIES`, a constant in a program whose
+bytes anyone can read. Nobody chooses which one goes — not the authority, not the
+submitter, not this program; the only way to lose an entry is for 128 further
+epochs to be finalized, which takes 13.6 hours. And the window is checkable
+before you depend on it: `LightClientState` names the head epoch, so `head - 127`
+is the oldest epoch the ring can be holding, and a consumer can compare the epoch
+it cares about against that before it commits to anything.
+
+`EpochNotInRing` exists so that this is not silently rounded off.
+`CheckpointNotFinalized` says Ethereum did not finalize that root; `EpochNotInRing`
+says this chain no longer stores the answer. A bridge should treat the first as a
+rejection and the second as "the message arrived too late", and it cannot do that
+if the two collapse into one error.
+
+Whether 13.6 hours is enough is a property of the consumer, not of this program.
+A bridge whose messages reference an epoch and settle within hours is well inside
+it; anything that may be asked about a checkpoint from last week needs to carry
+its own proof of it, or ask for a larger ring — the cost is linear and one-off.
+The ceiling is 10,240 bytes, the most a program can allocate in one instruction,
+which at this layout is 140 entries and just under 15 hours. Past that the ring
+would have to be grown across two instructions, and that is a different design
+rather than a bigger constant.
 
 ## Design
 
@@ -162,23 +245,58 @@ deployer's `initialize`.
 
 | Account | Seeds | Size | Holds |
 | --- | --- | --- | --- |
-| `LightClientState` | `["zkasper-state", authority]` | 186 | accumulator commitment, latest state root, finalized epoch and root, and the guest program key |
-| `FinalizationRecord` | `["zkasper-fin", authority, epoch_le]` | 114 | one accepted finalization, never rewritten |
-| `AnchorRecord` | `["zkasper-anchor", authority, state_root]` | 42 | a beacon state root some accepted proof named |
+| `LightClientState` | `["zkasper-state", authority]` | 186 | accumulator commitment and its epoch, latest state root, finalized epoch and root, and the guest program key |
+| `FinalizationRing` | `["zkasper-ring", authority]` | 9,346 | the last 128 accepted finalizations, written in place |
+
+Both are created by `initialize` and neither is created again. The ring is a
+two-byte header — a tag and the bump it was derived under — followed by 128
+entries of 73 bytes at `2 + (epoch % 128) * 73`:
+
+| Offset | Length | Field |
+| --- | --- | --- |
+| 0 | 1 | tag; zero until an epoch reaches this slot |
+| 1 | 8 | `finalized_epoch` — `u64` little-endian |
+| 9 | 32 | `finalized_root` |
+| 41 | 32 | `finalized_state_root` |
+
+The tag byte is what separates "never written" from a genuine epoch 0 with an
+all-zero root, since an untouched slot reads as exactly that.
+
+An entry carries what the two read paths need and nothing else. The record it
+replaced also held the accumulator commitment and the Solana slot it landed in,
+another 40 bytes; 128 of those would not fit under the 10,240-byte ceiling on
+what a program can allocate in one instruction, and neither field is read by
+`AssertFinalized` or `AssertAnchored`. Losing them costs a consumer less than it
+looks: the program enforces the accumulator chain at submission time, so no
+consumer has to re-check it, `LightClientState` carries the head's accumulator
+and its epoch, and the `(epoch, state_root)` pair an entry does keep is what the
+anchor walk below actually queries.
+
+The head stays in `LightClientState` rather than moving into the ring. It is
+read on every submission and it is where configuration lives, so the two have
+different lifetimes and different readers.
 
 ### Instructions
 
 | Tag | Instruction | Effect |
 | --- | --- | --- |
-| 0 | `Initialize` | trusted bootstrap: write the starting checkpoint and bind the guest key |
-| 1 | `SubmitFinalization` | verify the compressed proof carried in the instruction, advance the state, write a finalization record and an anchor record. Permissionless |
-| 2 | `AssertFinalized` | fail unless `root` was finalized at `epoch`. For CPI |
-| 3 | `AssertAnchored` | fail unless some accepted proof named `state_root`. For CPI |
+| 0 | `Initialize` | trusted bootstrap: write the starting checkpoint, allocate the ring, bind the guest key |
+| 1 | `SubmitFinalization` | verify the compressed proof carried in the instruction, advance the state, write the epoch's ring entry. Permissionless |
+| 2 | `AssertFinalized` | fail unless `root` was finalized at `epoch` and `epoch` is still in the ring. For CPI |
+| 3 | `AssertAnchored` | fail unless a finalization still in the ring named `state_root`. For CPI |
 | 4 | `VerifyOnly` | check a proof and change nothing. For `simulateTransaction` |
 
+`SubmitFinalization` names two accounts, both writable and neither of them new:
+the state and the ring. It creates nothing, so it takes no rent payer and no
+system program.
+
 The read path works two ways. A program that wants a hard failure CPIs
-`AssertFinalized`; a program that wants a value derives the record PDA and reads
-the account directly, with no CPI at all.
+`AssertFinalized`; a program that wants a value derives the ring PDA and reads
+the account directly, with no CPI at all. Reading it directly means doing what
+the program does — go to slot `epoch % 128`, then **check that the entry's own
+`finalized_epoch` is the epoch you asked about**. Skipping that check reads a
+wrapped-around slot as an answer. The program cannot skip it: the slot is never
+handed out, only `FinalizationRing::entry`, which compares before it returns.
 
 ### What the verifier deliberately skips
 
@@ -358,10 +476,12 @@ Bootstrap is where the two can disagree, and it is the reason to be careful with
 the first proof the client accepts finalizes `finalized_epoch + 1` and starts
 from that epoch's accumulator.
 
-`AnchorRecord`s are still written per accepted proof, keyed by
-`finalized_state_root`. They remain useful to a consumer reasoning about which
-beacon states the accumulator passed through, but they are no longer the only
-thing standing between a branch and acceptance.
+Every accepted proof's `finalized_state_root` still goes on chain, now as a
+field of its ring entry rather than an account of its own, and `AssertAnchored`
+still answers for it. It remains useful to a consumer reasoning about which
+beacon states the accumulator passed through, but it is no longer the only thing
+standing between a branch and acceptance — and it is answerable only for the
+last 128 epochs.
 
 ## Building and testing
 
@@ -388,7 +508,7 @@ program/       the on-chain program
   wire.rs      zkasper's output encoding and the public window
   plonk.rs     PLONK over BN254, through the alt_bn128 syscalls
   plonk/vk.rs  the circuit constants, and the only place a Zisk release is named
-  state.rs     account layouts
+  state.rs     account layouts, and the finalization ring
   instruction.rs  encoding and client-side builders
   processor.rs handlers
 program-tests/ LiteSVM integration tests, the cost measurements, and the
@@ -435,8 +555,11 @@ produce.
    — see "Accumulator chaining" — so publish which epoch it belongs to as well.
 
 6. **Close the `epoch-diff` succession gap, or ship the anchor check.** If the
-   gap stays open, every consumer needs the anchor-record walk described above,
-   and that requirement belongs in zkasper's own documentation, not only here.
+   gap stays open, every consumer needs the anchor walk described above, and that
+   requirement belongs in zkasper's own documentation, not only here. Say there
+   that the walk can only be completed on chain for state roots from the last 128
+   epochs; a consumer walking further back has to have collected the answers
+   while they were still there.
 
 7. **Record the trusted setup as an assumption.** The Zisk STARK is transparent;
    the PLONK wrap is not. Its structured reference string arrives as a 21.9 GB
@@ -462,9 +585,12 @@ ZKASPER_POSTINGS=/var/lib/zkasper/postings.jsonl \
 
 ```json
 {"chain":"solana-devnet","cluster":"devnet","epoch":469425,"signature":"4Jr…","slot":11,
- "compute_units":481004,"fee_lamports":5000,"rent_lamports":2867520,"lamports_spent":2872520,
+ "compute_units":476437,"fee_lamports":5000,"rent_lamports":0,"lamports_spent":5000,
  "status":"confirmed","explorer":"https://explorer.solana.com/tx/4Jr…?cluster=devnet","…":""}
 ```
+
+`rent_lamports` is zero for every submission after the bootstrap, and the field
+is kept so that it says so.
 
 `zkasperd --postings <path>` reads that file, publishes each new line as a
 `posting.landed` event and carries the recent ones in `status.json`, which is

@@ -1,7 +1,6 @@
 //! Instruction handlers.
 
 use solana_program::account_info::{next_account_info, AccountInfo};
-use solana_program::clock::Clock;
 use solana_program::entrypoint::ProgramResult;
 use solana_program::msg;
 use solana_program::program::{invoke, invoke_signed};
@@ -16,8 +15,8 @@ use crate::error::ZkasperError;
 use crate::instruction::ZkasperInstruction;
 use crate::plonk::COMPRESSED_PROOF_LEN;
 use crate::state::{
-    AnchorRecord, FinalizationRecord, LightClientState, ANCHOR_RECORD_LEN, FINALIZATION_RECORD_LEN,
-    LIGHT_CLIENT_LEN, SEED_ANCHOR, SEED_FINALIZATION, SEED_STATE,
+    FinalizationEntry, FinalizationRing, LightClientState, LIGHT_CLIENT_LEN, RING_LEN, SEED_RING,
+    SEED_STATE,
 };
 use crate::wire::{public_values, FinalizationOutput};
 
@@ -96,6 +95,7 @@ fn initialize(
     let iter = &mut accounts.iter();
     let authority = next_account_info(iter)?;
     let state_info = next_account_info(iter)?;
+    let ring_info = next_account_info(iter)?;
     let system = next_account_info(iter)?;
 
     if !authority.is_signer {
@@ -110,6 +110,12 @@ fn initialize(
         state_info,
         &[SEED_STATE, authority.key.as_ref()],
         ZkasperError::InvalidStateAccount,
+    )?;
+    let ring_bump = expect_pda(
+        program_id,
+        ring_info,
+        &[SEED_RING, authority.key.as_ref()],
+        ZkasperError::InvalidRingAccount,
     )?;
     if !state_info.data_is_empty() {
         return Err(ZkasperError::AccountAlreadyInitialized.into());
@@ -140,6 +146,18 @@ fn initialize(
     }
     .pack_into(&mut state_info.try_borrow_mut_data()?)?;
 
+    // The whole of what history costs, paid once. Every submission after this
+    // writes into these bytes and leaves nothing behind.
+    create_pda(
+        program_id,
+        authority,
+        ring_info,
+        system,
+        RING_LEN,
+        &[SEED_RING, authority.key.as_ref(), &[ring_bump]],
+    )?;
+    FinalizationRing::init(&mut ring_info.try_borrow_mut_data()?, ring_bump)?;
+
     msg!("zkasper bootstrap epoch {}", finalized_epoch);
     Ok(())
 }
@@ -155,18 +173,9 @@ fn submit_finalization(
     output: &FinalizationOutput,
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
     let state_info = next_account_info(iter)?;
-    let record_info = next_account_info(iter)?;
-    let anchor_info = next_account_info(iter)?;
-    let system = next_account_info(iter)?;
+    let ring_info = next_account_info(iter)?;
 
-    if !payer.is_signer {
-        return Err(ZkasperError::MissingSigner.into());
-    }
-    if !system_program::check_id(system.key) {
-        return Err(ProgramError::IncorrectProgramId);
-    }
     if state_info.owner != program_id {
         return Err(ZkasperError::InvalidStateAccount.into());
     }
@@ -230,26 +239,7 @@ fn submit_finalization(
         return Err(ZkasperError::AccumulatorEpochMismatch.into());
     }
 
-    let epoch_seed = output.finalized_epoch.to_le_bytes();
-    let record_bump = expect_pda(
-        program_id,
-        record_info,
-        &[SEED_FINALIZATION, authority.as_ref(), &epoch_seed],
-        ZkasperError::InvalidRecordAccount,
-    )?;
-    let anchor_bump = expect_pda(
-        program_id,
-        anchor_info,
-        &[
-            SEED_ANCHOR,
-            authority.as_ref(),
-            &output.finalized_state_root,
-        ],
-        ZkasperError::InvalidAnchorAccount,
-    )?;
-    if !record_info.data_is_empty() {
-        return Err(ZkasperError::AccountAlreadyInitialized.into());
-    }
+    expect_ring(program_id, ring_info, &authority)?;
 
     verify(proof, &state.program_vk, output)?;
 
@@ -266,53 +256,17 @@ fn submit_finalization(
     state.submission_count += 1;
     state.pack_into(&mut state_info.try_borrow_mut_data()?)?;
 
-    let slot = Clock::get()?.slot;
-    create_pda(
-        program_id,
-        payer,
-        record_info,
-        system,
-        FINALIZATION_RECORD_LEN,
-        &[
-            SEED_FINALIZATION,
-            authority.as_ref(),
-            &epoch_seed,
-            &[record_bump],
-        ],
-    )?;
-    FinalizationRecord {
-        bump: record_bump,
-        finalized_epoch: output.finalized_epoch,
-        finalized_root: output.finalized_root,
-        finalized_state_root: output.finalized_state_root,
-        accumulator_commitment: output.accumulator_commitment,
-        submitted_slot: slot,
-    }
-    .pack_into(&mut record_info.try_borrow_mut_data()?)?;
-
-    // Two epochs cannot share a beacon state root, so an existing anchor means
-    // this state root was already recorded. Leave the earlier one in place.
-    if anchor_info.data_is_empty() {
-        create_pda(
-            program_id,
-            payer,
-            anchor_info,
-            system,
-            ANCHOR_RECORD_LEN,
-            &[
-                SEED_ANCHOR,
-                authority.as_ref(),
-                &output.finalized_state_root,
-                &[anchor_bump],
-            ],
-        )?;
-        AnchorRecord {
-            bump: anchor_bump,
+    // Written in place, over whatever epoch held this slot 128 epochs ago. No
+    // account is created, so a submission costs the transaction fee and nothing
+    // else.
+    FinalizationRing::write(
+        &mut ring_info.try_borrow_mut_data()?,
+        &FinalizationEntry {
             finalized_epoch: output.finalized_epoch,
+            finalized_root: output.finalized_root,
             finalized_state_root: output.finalized_state_root,
-        }
-        .pack_into(&mut anchor_info.try_borrow_mut_data()?)?;
-    }
+        },
+    )?;
 
     msg!("zkasper finalized epoch {}", output.finalized_epoch);
     Ok(())
@@ -354,6 +308,9 @@ fn verify(
 // read path
 // ---------------------------------------------------------------------------
 
+/// Fails with [`ZkasperError::EpochNotInRing`] when `epoch` is older than the
+/// ring's 128-epoch window, which is a different statement from
+/// [`ZkasperError::CheckpointNotFinalized`] and must not be collapsed into it.
 fn assert_finalized(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -361,19 +318,12 @@ fn assert_finalized(
     epoch: u64,
     root: &[u8; 32],
 ) -> ProgramResult {
-    let record_info = next_account_info(&mut accounts.iter())?;
-    if record_info.owner != program_id {
-        return Err(ZkasperError::InvalidRecordAccount.into());
-    }
-    expect_pda(
-        program_id,
-        record_info,
-        &[SEED_FINALIZATION, authority.as_ref(), &epoch.to_le_bytes()],
-        ZkasperError::InvalidRecordAccount,
-    )?;
+    let ring_info = next_account_info(&mut accounts.iter())?;
+    expect_ring(program_id, ring_info, authority)?;
 
-    let record = FinalizationRecord::unpack(&record_info.try_borrow_data()?)?;
-    if record.finalized_epoch != epoch || record.finalized_root != *root {
+    // `entry` compares the stored epoch itself, so what comes back is this
+    // epoch's entry or nothing.
+    if FinalizationRing::entry(&ring_info.try_borrow_data()?, epoch)?.finalized_root != *root {
         return Err(ZkasperError::CheckpointNotFinalized.into());
     }
     Ok(())
@@ -385,27 +335,44 @@ fn assert_anchored(
     authority: &Pubkey,
     state_root: &[u8; 32],
 ) -> ProgramResult {
-    let anchor_info = next_account_info(&mut accounts.iter())?;
-    if anchor_info.owner != program_id {
-        return Err(ZkasperError::StateRootNotAnchored.into());
-    }
-    expect_pda(
-        program_id,
-        anchor_info,
-        &[SEED_ANCHOR, authority.as_ref(), state_root],
-        ZkasperError::InvalidAnchorAccount,
-    )?;
+    let ring_info = next_account_info(&mut accounts.iter())?;
+    expect_ring(program_id, ring_info, authority)?;
 
-    let anchor = AnchorRecord::unpack(&anchor_info.try_borrow_data()?)?;
-    if anchor.finalized_state_root != *state_root {
-        return Err(ZkasperError::StateRootNotAnchored.into());
-    }
+    FinalizationRing::entry_by_state_root(&ring_info.try_borrow_data()?, state_root)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// The ring account for `authority`, or a refusal.
+///
+/// The ring names the bump it was created under, so this is one hash rather than
+/// the walk `find_program_address` would run — and it is the derivation, not the
+/// tag, that proves the account is this authority's ring: nobody but this
+/// program can hold an account at that address, and only ring bytes are ever
+/// written there.
+fn expect_ring(
+    program_id: &Pubkey,
+    ring_info: &AccountInfo,
+    authority: &Pubkey,
+) -> Result<(), ZkasperError> {
+    if ring_info.owner != program_id {
+        return Err(ZkasperError::InvalidRingAccount);
+    }
+    let data = ring_info
+        .try_borrow_data()
+        .map_err(|_| ZkasperError::InvalidRingAccount)?;
+    let bump = FinalizationRing::bump(&data)?;
+    if Pubkey::create_program_address(&[SEED_RING, authority.as_ref(), &[bump]], program_id)
+        .map_err(|_| ZkasperError::InvalidRingAccount)?
+        != *ring_info.key
+    {
+        return Err(ZkasperError::InvalidRingAccount);
+    }
+    Ok(())
+}
 
 fn expect_pda(
     program_id: &Pubkey,
@@ -443,10 +410,10 @@ fn create_pda<'a>(
         );
     }
 
-    // `create_account` refuses an address that already holds lamports, and every
-    // address this program creates is derivable years in advance — so one
-    // lamport sent to a future epoch's finalization record would block that
-    // epoch for good. Allocate and assign instead, which is what
+    // `create_account` refuses an address that already holds lamports, and both
+    // addresses this program creates are derivable before anyone has run
+    // `initialize` — so one lamport sent to an authority's ring would block that
+    // light client for good. Allocate and assign instead, which is what
     // `create_account` does internally and which does not care about the
     // balance. Nobody but this program can allocate at a PDA, so an address
     // funded in advance is still empty and still ours.
