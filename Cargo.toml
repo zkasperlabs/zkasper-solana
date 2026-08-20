@@ -1,5 +1,5 @@
 [workspace]
-members = ["program", "fixture-gen", "program-tests", "cli"]
+members = ["program", "fixture-gen", "program-tests", "cli", "plonk-cost"]
 resolver = "2"
 
 [workspace.package]
