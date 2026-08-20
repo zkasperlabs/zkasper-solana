@@ -29,7 +29,7 @@ use zkasper_solana_program::state::{
 };
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// A whole submission measures 481,004 units; this leaves headroom without
+/// A whole submission measures 481,005 units; this leaves headroom without
 /// overpaying for a limit the runtime reserves block space against.
 const COMPUTE_UNIT_LIMIT: u32 = 700_000;
 

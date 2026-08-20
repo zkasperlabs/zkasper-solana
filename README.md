@@ -57,17 +57,17 @@ is refundable with `close_proof_buffer`.
 
 ## Measured cost
 
-A submission costs **481,004 compute units**, which does **not** fit Solana's
+A submission costs **481,005 compute units**, which does **not** fit Solana's
 200,000-unit default: every submitter must raise the limit with
 `ComputeBudgetProgram`. 700,000 is the value the CLI asks for.
 
 | Path | Compute units |
 | --- | --- |
-| `submit_finalization` — verify, advance state, write two records | **481,004** |
+| `submit_finalization` — verify, advance state, write two records | **481,005** |
 | `verify_only` — PLONK verification alone | 467,021 |
-| `stage_proof` — write 768 bytes, no cryptography | 4,872 |
+| `stage_proof` — write 768 bytes, no cryptography | 4,893 |
 | `assert_finalized` / `assert_anchored` — read path | 3,731 |
-| `initialize` — trusted bootstrap | 6,845 |
+| `initialize` — trusted bootstrap | 6,873 |
 
 Whole-transaction figures, each including 150 units for the `ComputeBudget`
 instruction itself. Measured under LiteSVM with mainnet's feature set, against

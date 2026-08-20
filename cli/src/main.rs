@@ -40,9 +40,9 @@ use zkasper_solana_program::plonk::PROOF_LEN;
 use zkasper_solana_program::state::{light_client_address, LightClientState};
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// A submission measures 481,004 units for the whole transaction; this leaves
+/// A submission measures 481,005 units for the whole transaction; this leaves
 /// headroom without overpaying for a limit the runtime reserves block space
-/// against. Staging costs 4,872 and rides the same limit.
+/// against. Staging costs 4,893 and rides the same limit.
 const COMPUTE_UNIT_LIMIT: u32 = 700_000;
 
 fn die(msg: &str) -> ! {
