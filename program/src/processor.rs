@@ -71,6 +71,16 @@ pub fn process_instruction(
 /// starting point every light client needs, and it is the operator's job to pick
 /// a finalized checkpoint that is old enough to be beyond weak subjectivity.
 ///
+/// `finalized_epoch` is the last epoch the operator claims is final; the first
+/// proof this client accepts is therefore the one finalizing `finalized_epoch +
+/// 1`, and `accumulator_commitment` has to be the accumulator *that* proof
+/// starts from — the one the epoch above the checkpoint was justified against,
+/// not the one the checkpoint itself was. The two parameters name adjacent
+/// epochs, which is why [`LightClientState::accumulator_epoch`] is set one
+/// above `finalized_epoch` rather than equal to it. Getting this pair wrong
+/// costs the operator their first submission and nothing else: it is caught,
+/// not adopted.
+///
 /// `program_vk` is the other half of what this instruction fixes, and it is not
 /// subjective at all: it decides *which guest's* proofs this light client will
 /// accept. See [`LightClientState::program_vk`].
@@ -124,7 +134,10 @@ fn initialize(
         finalized_root: *finalized_root,
         program_vk: *program_vk,
         submission_count: 0,
-        accumulator_epoch: finalized_epoch,
+        // Overflowing here would mean a bootstrap at epoch `u64::MAX`, which no
+        // proof could ever extend. `overflow-checks` is on in release, so that
+        // bootstrap is refused rather than wrapped to zero.
+        accumulator_epoch: finalized_epoch + 1,
     }
     .pack_into(&mut state_info.try_borrow_mut_data()?)?;
 
@@ -267,6 +280,24 @@ fn submit_finalization(
         return Err(ZkasperError::AccumulatorMismatch.into());
     }
 
+    // Same accumulator, but is it the same *epoch*? A commitment binds a
+    // validator-set root and a total active balance and nothing else, so two
+    // epochs that left the set untouched are byte-identical here and the check
+    // above would wave a skipped epoch through. On mainnet the set moves every
+    // epoch, which is why no gap has slipped past -- an accident of the network,
+    // not a guarantee of the format.
+    //
+    // The gap matters because zkasper proves the supermajority target vote and
+    // the ancestry of the finalized root, never the FFG link. A consumer is left
+    // with Casper's double-vote clause, and that clause only bites while every
+    // epoch in the sequence carries a supermajority vote. So consecutiveness is
+    // the safety property, and it is checked here rather than inferred from the
+    // validator set happening to churn.
+    if state.accumulator_epoch != output.finalized_epoch {
+        msg!("zkasper: finalization does not start at the epoch this client holds");
+        return Err(ZkasperError::AccumulatorEpochMismatch.into());
+    }
+
     let epoch_seed = output.finalized_epoch.to_le_bytes();
     let record_bump = expect_pda(
         program_id,
@@ -290,6 +321,10 @@ fn submit_finalization(
 
     verify_staged(program_id, payer, buffer_info, &state.program_vk, output)?;
 
+    // Both halves of one accumulator move together: the far end of the
+    // transition, and the epoch that end belongs to. The guest asserts the two
+    // epochs are adjacent, so this is the check above rearmed for the next
+    // submission.
     state.accumulator_commitment = output.next_accumulator_commitment;
     state.accumulator_epoch = output.justified_epoch;
 

@@ -31,6 +31,14 @@ pub enum ZkasperError {
     AccumulatorMismatch = 15,
     /// The staging account is not this submitter's proof buffer.
     InvalidProofBuffer = 16,
+    /// The accumulator matched, but it is not the accumulator of the epoch this
+    /// finalization claims to start from — the submission skips an epoch.
+    ///
+    /// [`Self::AccumulatorMismatch`] cannot catch this on its own: an
+    /// accumulator commitment binds the validator-set root and the total active
+    /// balance, and no epoch, so two epochs that did not change the set commit
+    /// to the same 32 bytes.
+    AccumulatorEpochMismatch = 17,
 }
 
 impl From<ZkasperError> for ProgramError {

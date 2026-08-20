@@ -318,7 +318,10 @@ fn main() {
                 "accumulator    0x{}",
                 hex::encode(state.accumulator_commitment)
             );
-            println!("  last changed epoch {}", state.accumulator_epoch);
+            println!(
+                "  of epoch     {} (the next proof must finalize it)",
+                state.accumulator_epoch
+            );
             println!("guest vk       0x{}", hex::encode(state.program_vk));
             println!("submissions    {}", state.submission_count);
         }

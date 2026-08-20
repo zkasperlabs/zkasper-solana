@@ -329,6 +329,29 @@ match what is stored, and the submission is rejected with
 This replaced an earlier design that adopted any new commitment optimistically
 and left detection to the consumer.
 
+**Unbranched is not the same as consecutive.** An accumulator commitment binds a
+validator-set root and a total active balance, and no epoch: two epochs that left
+the validator set untouched commit to identical bytes. On its own the check above
+would therefore let a client sitting one epoch further back than it thinks accept
+a proof that skips an epoch — no branch, just a hole. That no gap has slipped
+past is a fact about mainnet, where the validator set churns every epoch and so
+keeps the commitment moving, not a property of the format.
+
+So the state also carries `accumulator_epoch`, the epoch its accumulator belongs
+to, and a submission must finalize exactly that epoch or be rejected with
+`AccumulatorEpochMismatch`. This is load-bearing rather than tidy: zkasper proves
+the supermajority target vote and the ancestry of the finalized root, but never
+the FFG link, so a consumer holds only Casper's double-vote clause — and that
+clause binds only while *every* epoch in the sequence carries a supermajority
+vote. One gap and it does not. See `docs/finality/assumptions.md` in the zkasper
+repository.
+
+Bootstrap is where the two can disagree, and it is the reason to be careful with
+`Initialize`: its `finalized_epoch` is the checkpoint being trusted, while its
+`accumulator_commitment` belongs to the epoch *above* that checkpoint, because
+the first proof the client accepts finalizes `finalized_epoch + 1` and starts
+from that epoch's accumulator.
+
 `AnchorRecord`s are still written per accepted proof, keyed by
 `finalized_state_root`. They remain useful to a consumer reasoning about which
 beacon states the accumulator passed through, but they are no longer the only
@@ -402,6 +425,8 @@ produce.
 5. **Pick a bootstrap checkpoint** and publish `accumulator_commitment`,
    `latest_state_root`, `finalized_epoch` and `finalized_root` for it, along with
    how they were derived, so consumers can check the starting point themselves.
+   Note that `accumulator_commitment` is the accumulator of `finalized_epoch + 1`
+   — see "Accumulator chaining" — so publish which epoch it belongs to as well.
 
 6. **Close the `epoch-diff` succession gap, or ship the anchor check.** If the
    gap stays open, every consumer needs the anchor-record walk described above,

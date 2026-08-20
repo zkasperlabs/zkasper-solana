@@ -180,6 +180,10 @@ fn bootstrap_writes_the_trusted_checkpoint() {
     );
     assert_eq!(state.finalized_epoch, h.f.output.finalized_epoch - 1);
     assert_eq!(state.submission_count, 0);
+    // The bootstrap accumulator belongs to the epoch above the trusted
+    // checkpoint, so it is labelled with that epoch -- which is exactly the
+    // `finalized_epoch` the first accepted proof must carry.
+    assert_eq!(state.accumulator_epoch, h.f.output.finalized_epoch);
 }
 
 #[test]
@@ -286,6 +290,62 @@ fn rejects_a_finalization_from_a_branched_accumulator() {
     out.accumulator_commitment[0] ^= 1;
     let result = h.submit(&out);
     custom_error(&result, ZkasperError::AccumulatorMismatch);
+}
+
+/// A genuine proof, starting from exactly the accumulator this client holds,
+/// that still finalizes the wrong epoch.
+///
+/// This is the case the commitment check provably cannot see. An accumulator
+/// commitment binds a validator-set root and a total active balance and no
+/// epoch, so a client sitting one epoch further back than it thinks holds bytes
+/// that match a proof it should not accept. Bootstrapping two epochs below the
+/// proof builds that state directly: the client is missing
+/// `finalized_epoch - 1`, and adopting this proof would leave a hole.
+///
+/// Bootstrapping wrong is how the case is reached, because the proof itself
+/// cannot be edited into it -- `finalized_epoch` is bound by the public-input
+/// hash, so mutating it fails verification first, with a different error.
+///
+/// Consecutiveness is the safety property: zkasper never proves the FFG link,
+/// so a consumer holds only the double-vote clause, and that clause binds only
+/// while every epoch in the sequence carries a supermajority vote.
+#[test]
+fn rejects_a_finalization_that_skips_an_epoch() {
+    let mut h = Harness::new();
+    let out = h.f.output;
+    let program_vk = h.f.program_vk;
+    h.ok(&[ix::initialize(
+        &h.program_id,
+        &h.payer.pubkey(),
+        &out.accumulator_commitment,
+        &[0u8; 32],
+        out.finalized_epoch - 2,
+        &[0u8; 32],
+        &program_vk,
+    )]);
+    // The state that makes this a real test: the accumulator matches the proof
+    // byte for byte, and only the epoch label disagrees. Neither of the two
+    // checks that came before this one can fire.
+    let before = h.state();
+    assert_eq!(before.accumulator_commitment, out.accumulator_commitment);
+    assert_eq!(before.accumulator_epoch, out.finalized_epoch - 1);
+    assert!(out.finalized_epoch > before.finalized_epoch);
+
+    h.stage();
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::AccumulatorEpochMismatch);
+
+    // Rejected, not adopted: no hole was opened at `finalized_epoch - 1`.
+    let after = h.state();
+    assert_eq!(after.finalized_epoch, out.finalized_epoch - 2);
+    assert_eq!(after.accumulator_epoch, out.finalized_epoch - 1);
+    assert_eq!(after.submission_count, 0);
+    assert!(h
+        .svm
+        .get_account(
+            &finalization_record_address(&h.program_id, &h.payer.pubkey(), out.finalized_epoch).0
+        )
+        .is_none_or(|a| a.data.is_empty()));
 }
 
 /// The same proof, under a light client that pins a different guest key. The

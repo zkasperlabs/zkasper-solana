@@ -104,15 +104,33 @@ pub struct LightClientState {
     /// means "which guest do you trust" is answered by naming an authority.
     pub program_vk: ProgramVk,
     pub submission_count: u64,
-    /// Epoch the stored accumulator was proven against: the `justified_epoch` of
-    /// the last accepted proof, which is the far end of the transition that
-    /// proof covered.
+    /// The epoch [`Self::accumulator_commitment`] belongs to: the epoch whose
+    /// justification that accumulator was proven against.
     ///
-    /// The program does not constrain it, and does not need to: the guest
-    /// asserts "justification epochs not consecutive" unless
-    /// `justified_epoch == finalized_epoch + 1`
-    /// (`crates/stream-final-guest/src/lib.rs`), and `finalized_epoch` has to
-    /// strictly increase to be accepted here.
+    /// Equivalently, and this is how `submit_finalization` reads it: the
+    /// `finalized_epoch` the next accepted proof must carry. A finalization
+    /// starts from the accumulator its own finalized epoch was justified
+    /// against, so a proof may extend this client only if it finalizes exactly
+    /// this epoch.
+    ///
+    /// Checking it is what makes the chain consecutive rather than merely
+    /// unbranched. The commitment alone cannot: [`AccumulatorCommitment`] binds
+    /// a validator-set root and a total active balance and no epoch, so two
+    /// epochs that left the set untouched commit to identical bytes and a
+    /// skipped epoch would pass. That the set moves every epoch on mainnet is
+    /// an observation about mainnet, not a property of the format.
+    ///
+    /// Consecutiveness is load-bearing because zkasper proves the supermajority
+    /// vote and the ancestry of the finalized root but never the FFG link, which
+    /// leaves a consumer only Casper's double-vote clause — and that clause
+    /// binds only while every epoch in the sequence carries a supermajority
+    /// vote. See `docs/finality/assumptions.md` in the zkasper repository.
+    ///
+    /// Always `finalized_epoch + 1`: bootstrap sets it so, and thereafter it is
+    /// the accepted proof's `justified_epoch`, which the guest asserts is its
+    /// `finalized_epoch + 1` ("justification epochs not consecutive",
+    /// `crates/stream-final-guest/src/lib.rs`). It is stored rather than derived
+    /// because it labels the accumulator, which is the value being matched.
     pub accumulator_epoch: u64,
 }
 

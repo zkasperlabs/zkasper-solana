@@ -37,13 +37,26 @@ pub enum ZkasperInstruction<'a> {
     /// Trusted bootstrap. Creates the light-client state from an operator-chosen
     /// checkpoint and binds the guest key every proof will be checked against.
     ///
+    /// The two epochs this names are adjacent, and it is worth being explicit
+    /// about which is which. `finalized_epoch` and `finalized_root` are the
+    /// checkpoint being trusted. `accumulator_commitment` belongs to the epoch
+    /// *above* it: the first proof this client can accept is the one finalizing
+    /// `finalized_epoch + 1`, and a finalization starts from the accumulator its
+    /// own finalized epoch was justified against. Supplying the checkpoint's own
+    /// accumulator instead is the natural mistake and it is caught at the first
+    /// submission.
+    ///
     /// Accounts:
     /// 0. `[signer, writable]` authority and rent payer
     /// 1. `[writable]`         light-client state PDA
     /// 2. `[]`                 system program
     Initialize {
+        /// The accumulator the epoch above `finalized_epoch` was justified
+        /// against — what the first accepted proof must start from.
         accumulator_commitment: &'a [u8; 32],
         latest_state_root: &'a [u8; 32],
+        /// The last epoch the operator trusts as final. The first accepted
+        /// proof finalizes the epoch after it.
         finalized_epoch: u64,
         finalized_root: &'a [u8; 32],
         program_vk: &'a [u8; 32],
@@ -189,6 +202,9 @@ impl<'a> ZkasperInstruction<'a> {
 // Builders
 // ---------------------------------------------------------------------------
 
+/// See [`ZkasperInstruction::Initialize`] for which epoch each argument names:
+/// `accumulator_commitment` belongs to `finalized_epoch + 1`, not to
+/// `finalized_epoch`.
 pub fn initialize(
     program_id: &Pubkey,
     authority: &Pubkey,
