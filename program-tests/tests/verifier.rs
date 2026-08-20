@@ -369,6 +369,34 @@ fn re_staging_overwrites_and_costs_no_extra_rent() {
     assert!(h.svm.get_account(&buffer).is_none_or(|a| a.lamports == 0));
 }
 
+/// Every address this program creates is derivable in advance, and
+/// `create_account` refuses an address that already holds lamports. Funding one
+/// ahead of a submission must not be able to block it.
+///
+/// The runtime will not let a transaction leave an account rent-paying, so the
+/// cheapest such grief is the rent-exempt minimum of an empty account —
+/// 890,880 lamports, and it has to be spent per address. With the allocate path
+/// below it buys nothing at all: the lamports are absorbed into the account the
+/// program then creates, so the griefer pays part of the submitter's rent.
+#[test]
+fn survives_addresses_funded_in_advance() {
+    let mut h = Harness::new();
+    h.initialize();
+    let out = h.f.output;
+    let payer = h.payer.pubkey();
+    for address in [
+        proof_buffer_address(&h.program_id, &payer).0,
+        finalization_record_address(&h.program_id, &payer, out.finalized_epoch).0,
+        anchor_record_address(&h.program_id, &payer, &out.finalized_state_root).0,
+    ] {
+        h.svm.airdrop(&address, 890_880).unwrap();
+    }
+    h.stage();
+    h.submit(&out)
+        .expect("a funded address blocked the submission");
+    assert_eq!(h.state().finalized_epoch, out.finalized_epoch);
+}
+
 // ---------------------------------------------------------------------------
 // read path
 // ---------------------------------------------------------------------------

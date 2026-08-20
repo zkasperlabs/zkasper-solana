@@ -4,7 +4,7 @@ use solana_program::account_info::{next_account_info, AccountInfo};
 use solana_program::clock::Clock;
 use solana_program::entrypoint::ProgramResult;
 use solana_program::msg;
-use solana_program::program::invoke_signed;
+use solana_program::program::{invoke, invoke_signed};
 use solana_program::program_error::ProgramError;
 use solana_program::pubkey::Pubkey;
 use solana_program::rent::Rent;
@@ -488,16 +488,43 @@ fn create_pda<'a>(
     space: usize,
     seeds: &[&[u8]],
 ) -> ProgramResult {
-    let lamports = Rent::get()?.minimum_balance(space);
+    let rent = Rent::get()?.minimum_balance(space);
+    if target.lamports() == 0 {
+        return invoke_signed(
+            &system_instruction::create_account(
+                payer.key,
+                target.key,
+                rent,
+                space as u64,
+                program_id,
+            ),
+            &[payer.clone(), target.clone(), system.clone()],
+            &[seeds],
+        );
+    }
+
+    // `create_account` refuses an address that already holds lamports, and every
+    // address this program creates is derivable years in advance — so one
+    // lamport sent to a future epoch's finalization record would block that
+    // epoch for good. Allocate and assign instead, which is what
+    // `create_account` does internally and which does not care about the
+    // balance. Nobody but this program can allocate at a PDA, so an address
+    // funded in advance is still empty and still ours.
+    let top_up = rent.saturating_sub(target.lamports());
+    if top_up > 0 {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, top_up),
+            &[payer.clone(), target.clone(), system.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            target.key,
-            lamports,
-            space as u64,
-            program_id,
-        ),
-        &[payer.clone(), target.clone(), system.clone()],
+        &system_instruction::allocate(target.key, space as u64),
+        &[target.clone(), system.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, program_id),
+        &[target.clone(), system.clone()],
         &[seeds],
     )
 }

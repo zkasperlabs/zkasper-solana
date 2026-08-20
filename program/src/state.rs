@@ -104,7 +104,9 @@ pub struct LightClientState {
     /// means "which guest do you trust" is answered by naming an authority.
     pub program_vk: ProgramVk,
     pub submission_count: u64,
-    /// Epoch whose proof last changed `accumulator_commitment`.
+    /// Epoch the stored accumulator was proven against: the `justified_epoch` of
+    /// the last accepted proof, which is the far end of the transition that
+    /// proof covered.
     pub accumulator_epoch: u64,
 }
 
