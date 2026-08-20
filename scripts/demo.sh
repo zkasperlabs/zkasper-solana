@@ -58,20 +58,23 @@ cli() { cargo run --quiet --release -p zkasper-cli -- "$RPC_URL" "$KEYPAIR" "$@"
 step "addresses"
 cli address
 
+WRAP=fixtures/wrap-469426.json
+
 step "bootstrap (trusted, unproved)"
-cli init fixtures
+cli init "$WRAP"
 cli show
 
-step "submit three fixture finalization proofs"
-for i in 0 1 2; do
-  cli submit fixtures "$i"
-done
+step "stage the wrapped proof, then submit it"
+cli stage "$WRAP"
+cli submit "$WRAP"
 cli show
 
 step "read path"
-EPOCH=$(python3 -c "import json;d=json.load(open('fixtures/fixtures.json'));print(d['finalizations'][0]['finalized_epoch'])")
-ROOT=$(python3 -c "import json;d=json.load(open('fixtures/fixtures.json'));print(d['finalizations'][0]['finalized_root'])")
-STATE_ROOT=$(python3 -c "import json;d=json.load(open('fixtures/fixtures.json'));print(d['finalizations'][0]['finalized_state_root'])")
+read -r EPOCH ROOT STATE_ROOT <<<"$(python3 -c "
+import json
+p = bytes.fromhex(json.load(open('$WRAP'))['publicValues'][2:])
+print(int.from_bytes(p[64:72], 'little'), '0x' + p[72:104].hex(), '0x' + p[104:136].hex())
+")"
 
 echo "assert_finalized epoch=$EPOCH root=$ROOT"
 cli assert-finalized "$EPOCH" "$ROOT"
@@ -84,5 +87,8 @@ if cli assert-anchored 0x0000000000000000000000000000000000000000000000000000000
   echo "UNEXPECTED: unanchored state root was accepted" >&2
   exit 1
 fi
+
+step "reclaim the staging rent"
+cli close-buffer
 
 printf '\n=== demo complete\n'

@@ -13,7 +13,8 @@ pub enum ZkasperError {
     InvalidRecordAccount = 5,
     InvalidAnchorAccount = 6,
     MissingSigner = 7,
-    /// The Groth16 pairing check failed.
+    /// The PLONK check failed: a malformed proof, a point off the curve, or a
+    /// proof of a statement other than the one claimed.
     ProofVerificationFailed = 8,
     /// `finalized_epoch` did not strictly increase.
     EpochNotAdvancing = 9,
@@ -32,6 +33,8 @@ pub enum ZkasperError {
     /// a branch. Rejecting is what keeps the chain unbroken without the program
     /// ever seeing an epoch-diff proof.
     AccumulatorMismatch = 15,
+    /// The staging account is not this submitter's proof buffer.
+    InvalidProofBuffer = 16,
 }
 
 impl From<ZkasperError> for ProgramError {

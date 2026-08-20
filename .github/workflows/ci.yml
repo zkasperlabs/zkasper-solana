@@ -22,10 +22,8 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --all -- --check
       - run: ./scripts/build.sh
+      - run: cargo-build-sbf --manifest-path plonk-cost/Cargo.toml --arch v3
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test -p zkasper-solana-program --features no-entrypoint
       - run: cargo test -p zkasper-program-tests -- --nocapture --test-threads=1
-      - name: Fixtures must be reproducible
-        run: |
-          ./scripts/fixtures.sh
-          git diff --exit-code fixtures/
+      - run: cargo test -p zkasper-plonk-cost -- --nocapture

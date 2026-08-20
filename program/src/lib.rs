@@ -2,8 +2,13 @@
 //!
 //! zkasper proves, in a Zisk zkVM, that an Ethereum beacon-chain checkpoint was
 //! finalized under Casper FFG by at least two thirds of the *full* validator
-//! set. This program holds a light-client state account, checks the Groth16 wrap
+//! set. This program holds a light-client state account, checks the PLONK wrap
 //! of that proof with Solana's BN254 syscalls, and advances the state.
+//!
+//! A wrapped proof is 768 bytes, which does not fit a Solana packet beside the
+//! output it attests to, so a submission is two transactions: `StageProof` parks
+//! the proof in a buffer the submitter owns, and `SubmitFinalization` verifies
+//! it from there.
 //!
 //! See the README for the trust model, and in particular for the `epoch-diff`
 //! successor gap that makes the anchor records in [`state::AnchorRecord`] load
@@ -11,9 +16,9 @@
 
 pub mod error;
 pub mod instruction;
+pub mod plonk;
 pub mod processor;
 pub mod state;
-pub mod verifier;
 pub mod wire;
 
 solana_program::declare_id!("Cuarryex9DFpVm6HNdCFvpS3EEeArSuTXDMNTk9hpKja");

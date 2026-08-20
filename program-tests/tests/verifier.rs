@@ -1,101 +1,55 @@
 //! End-to-end tests against the compiled SBF program, under LiteSVM.
 //!
-//! The proofs are the placeholder fixtures described in `fixtures/README.md`:
-//! real Groth16 over a circuit that says nothing about Ethereum. Every BN254
-//! operation the program performs is real, so the compute-unit numbers these
-//! tests print are the numbers a real proof will cost.
+//! The proof is the real one: `fixtures/wrap-469426.json`, produced by
+//! `cargo-zisk wrap --plonk`. Every BN254 operation the program performs runs
+//! for real inside the SVM, so the compute-unit and transaction-size numbers
+//! these tests print are the numbers a submission costs.
 //!
 //! Run `scripts/build.sh` first; the tests load `target/deploy/*.so`.
 
 use litesvm::types::TransactionMetadata;
 use litesvm::LiteSVM;
+use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_instruction::Instruction;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
-use solana_message::Message;
+use solana_message::{v0, AddressLookupTableAccount, Message, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction::Transaction;
 
+use zkasper_program_tests::{fixture, proof_array, Fixture};
 use zkasper_solana_program::error::ZkasperError;
 use zkasper_solana_program::instruction as ix;
+use zkasper_solana_program::plonk::PROOF_LEN;
 use zkasper_solana_program::state::{
-    anchor_record_address, finalization_record_address, light_client_address, AnchorRecord,
-    FinalizationRecord, LightClientState, VK_LEN,
+    anchor_record_address, finalization_record_address, light_client_address, proof_buffer_address,
+    AnchorRecord, FinalizationRecord, LightClientState, PROOF_BUFFER_LEN,
 };
-use zkasper_solana_program::wire::FinalizationOutput;
+use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-// ---------------------------------------------------------------------------
-// fixtures
-// ---------------------------------------------------------------------------
+/// A whole submission measures 599,331 units; this leaves headroom without
+/// overpaying for a limit the runtime reserves block space against.
+const COMPUTE_UNIT_LIMIT: u32 = 700_000;
 
-const BOOTSTRAP: &[u8] = include_bytes!("../../fixtures/bootstrap.bin");
-const FINALIZATIONS: [&[u8]; 3] = [
-    include_bytes!("../../fixtures/finalization_0.bin"),
-    include_bytes!("../../fixtures/finalization_1.bin"),
-    include_bytes!("../../fixtures/finalization_2.bin"),
-];
-
-fn a32(buf: &[u8], off: usize) -> [u8; 32] {
-    buf[off..off + 32].try_into().unwrap()
-}
-
-struct Bootstrap {
-    accumulator_commitment: [u8; 32],
-    latest_state_root: [u8; 32],
-    finalized_epoch: u64,
-    finalized_root: [u8; 32],
-    program_vk: [u8; 32],
-    vk: [u8; VK_LEN],
-}
-
-fn bootstrap() -> Bootstrap {
-    Bootstrap {
-        accumulator_commitment: a32(BOOTSTRAP, 0),
-        latest_state_root: a32(BOOTSTRAP, 32),
-        finalized_epoch: u64::from_le_bytes(BOOTSTRAP[64..72].try_into().unwrap()),
-        finalized_root: a32(BOOTSTRAP, 72),
-        program_vk: a32(BOOTSTRAP, 104),
-        vk: BOOTSTRAP[136..136 + VK_LEN].try_into().unwrap(),
-    }
-}
-
-struct Finalization {
-    a: [u8; 64],
-    b: [u8; 128],
-    c: [u8; 64],
-    output: FinalizationOutput,
-}
-
-fn finalization(i: usize) -> Finalization {
-    let buf = FINALIZATIONS[i];
-    Finalization {
-        a: buf[0..64].try_into().unwrap(),
-        b: buf[64..192].try_into().unwrap(),
-        c: buf[192..256].try_into().unwrap(),
-        output: FinalizationOutput {
-            accumulator_commitment: a32(buf, 256),
-            next_accumulator_commitment: a32(buf, 288),
-            finalized_epoch: u64::from_le_bytes(buf[320..328].try_into().unwrap()),
-            finalized_root: a32(buf, 328),
-            finalized_state_root: a32(buf, 360),
-        },
-    }
-}
-
-// ---------------------------------------------------------------------------
-// harness
-// ---------------------------------------------------------------------------
+/// Solana's packet limit. Nothing larger than this reaches a leader.
+const PACKET_LIMIT: u64 = 1232;
 
 const SO_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../target/deploy/zkasper_solana_program.so"
 );
 
+// ---------------------------------------------------------------------------
+// harness
+// ---------------------------------------------------------------------------
+
 struct Harness {
     svm: LiteSVM,
     payer: Keypair,
     program_id: Pubkey,
+    f: Fixture,
 }
 
 impl Harness {
@@ -103,7 +57,9 @@ impl Harness {
         let so = std::fs::read(SO_PATH)
             .unwrap_or_else(|e| panic!("{SO_PATH}: {e}\nrun scripts/build.sh first"));
         let program_id = zkasper_solana_program::id();
-        let mut svm = LiteSVM::new();
+        // Mainnet's feature set rather than LiteSVM's default, which activates
+        // none: the `alt_bn128` syscalls this program lives on are gated.
+        let mut svm = LiteSVM::new().with_mainnet_features();
         svm.add_program(program_id, &so).unwrap();
         // Fixed, so every PDA lands on the same bump and the compute-unit
         // numbers below are reproducible. `find_program_address` walks bumps
@@ -114,68 +70,78 @@ impl Harness {
             svm,
             payer,
             program_id,
+            f: fixture(),
         }
     }
 
-    /// Sends `ixs` with an explicit compute-unit limit.
-    #[allow(clippy::result_large_err)]
-    fn send_with_limit(
-        &mut self,
-        limit: u32,
-        ixs: &[Instruction],
-    ) -> litesvm::types::TransactionResult {
-        let mut all = vec![ComputeBudgetInstruction::set_compute_unit_limit(limit)];
+    /// The transaction a submitter actually sends: a compute-budget raise, then
+    /// the instruction.
+    fn transaction(&self, ixs: &[Instruction], limit: Option<u32>) -> Transaction {
+        let mut all = Vec::new();
+        if let Some(limit) = limit {
+            all.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+        }
         all.extend_from_slice(ixs);
-        self.send_raw(&all)
-    }
-
-    /// Sends `ixs` with no compute-budget instruction, so the runtime applies
-    /// the 200,000-unit default.
-    #[allow(clippy::result_large_err)]
-    fn send_raw(&mut self, ixs: &[Instruction]) -> litesvm::types::TransactionResult {
         let msg = Message::new_with_blockhash(
-            ixs,
+            &all,
             Some(&self.payer.pubkey()),
             &self.svm.latest_blockhash(),
         );
-        let tx = Transaction::new(&[&self.payer], msg, self.svm.latest_blockhash());
+        Transaction::new(&[&self.payer], msg, self.svm.latest_blockhash())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn send(
+        &mut self,
+        ixs: &[Instruction],
+        limit: Option<u32>,
+    ) -> litesvm::types::TransactionResult {
+        let tx = self.transaction(ixs, limit);
         let result = self.svm.send_transaction(tx);
         self.svm.expire_blockhash();
         result
     }
 
     fn ok(&mut self, ixs: &[Instruction]) -> TransactionMetadata {
-        self.send_with_limit(400_000, ixs)
+        self.send(ixs, Some(COMPUTE_UNIT_LIMIT))
             .unwrap_or_else(|e| panic!("{:?}\n{}", e.err, e.meta.pretty_logs()))
     }
 
+    /// Bootstrap one epoch below the proof, on the accumulator it starts from.
     fn initialize(&mut self) -> TransactionMetadata {
-        let b = bootstrap();
+        let program_vk = self.f.program_vk;
+        self.initialize_with(&program_vk)
+    }
+
+    fn initialize_with(&mut self, program_vk: &[u8; 32]) -> TransactionMetadata {
+        let out = self.f.output;
         let instruction = ix::initialize(
             &self.program_id,
             &self.payer.pubkey(),
-            &b.accumulator_commitment,
-            &b.latest_state_root,
-            b.finalized_epoch,
-            &b.finalized_root,
-            &b.program_vk,
-            &b.vk,
+            &out.accumulator_commitment,
+            &[0u8; 32],
+            out.finalized_epoch - 1,
+            &[0u8; 32],
+            program_vk,
         );
         self.ok(&[instruction])
     }
 
+    fn stage(&mut self) -> TransactionMetadata {
+        let proof = proof_array(&self.f);
+        let instruction = ix::stage_proof(&self.program_id, &self.payer.pubkey(), &proof);
+        self.ok(&[instruction])
+    }
+
     #[allow(clippy::result_large_err)]
-    fn submit(&mut self, f: &Finalization) -> litesvm::types::TransactionResult {
+    fn submit(&mut self, output: &FinalizationOutput) -> litesvm::types::TransactionResult {
         let instruction = ix::submit_finalization(
             &self.program_id,
             &self.payer.pubkey(),
             &self.payer.pubkey(),
-            &f.a,
-            &f.b,
-            &f.c,
-            &f.output,
+            output,
         );
-        self.send_with_limit(400_000, &[instruction])
+        self.send(&[instruction], Some(COMPUTE_UNIT_LIMIT))
     }
 
     fn state(&self) -> LightClientState {
@@ -198,279 +164,293 @@ fn custom_error(result: &litesvm::types::TransactionResult, expected: ZkasperErr
 }
 
 // ---------------------------------------------------------------------------
-// tests
+// bootstrap
 // ---------------------------------------------------------------------------
 
 #[test]
 fn bootstrap_writes_the_trusted_checkpoint() {
     let mut h = Harness::new();
     h.initialize();
-
-    let b = bootstrap();
     let state = h.state();
-    assert_eq!(state.accumulator_commitment, b.accumulator_commitment);
-    assert_eq!(state.latest_state_root, b.latest_state_root);
-    assert_eq!(state.finalized_epoch, b.finalized_epoch);
-    assert_eq!(state.finalized_root, b.finalized_root);
-    assert_eq!(state.program_vk, b.program_vk);
-    assert_eq!(state.submission_count, 0);
     assert_eq!(state.authority, h.payer.pubkey());
+    assert_eq!(state.program_vk, h.f.program_vk);
+    assert_eq!(
+        state.accumulator_commitment,
+        h.f.output.accumulator_commitment
+    );
+    assert_eq!(state.finalized_epoch, h.f.output.finalized_epoch - 1);
+    assert_eq!(state.submission_count, 0);
 }
 
 #[test]
 fn rejects_a_second_bootstrap() {
     let mut h = Harness::new();
     h.initialize();
-
-    let b = bootstrap();
+    let out = h.f.output;
+    let program_vk = h.f.program_vk;
     let instruction = ix::initialize(
         &h.program_id,
         &h.payer.pubkey(),
-        &b.accumulator_commitment,
-        &b.latest_state_root,
-        b.finalized_epoch,
-        &b.finalized_root,
-        &b.program_vk,
-        &b.vk,
+        &out.accumulator_commitment,
+        &[0u8; 32],
+        out.finalized_epoch - 1,
+        &[0u8; 32],
+        &program_vk,
     );
-    let result = h.send_with_limit(400_000, &[instruction]);
+    let result = h.send(&[instruction], Some(COMPUTE_UNIT_LIMIT));
     custom_error(&result, ZkasperError::AccountAlreadyInitialized);
 }
 
+// ---------------------------------------------------------------------------
+// the submission path
+// ---------------------------------------------------------------------------
+
 #[test]
-fn advances_through_three_finalizations() {
+fn a_staged_wrapped_proof_advances_the_light_client() {
     let mut h = Harness::new();
     h.initialize();
-    let bootstrap_acc = bootstrap().accumulator_commitment;
+    h.stage();
+    let out = h.f.output;
+    h.submit(&out)
+        .expect("the real proof was rejected on chain");
 
-    for i in 0..3 {
-        let f = finalization(i);
-        h.submit(&f).unwrap_or_else(|e| {
-            panic!(
-                "epoch {}: {:?}\n{}",
-                f.output.finalized_epoch,
-                e.err,
-                e.meta.pretty_logs()
-            )
-        });
-
-        let state = h.state();
-        assert_eq!(state.finalized_epoch, f.output.finalized_epoch);
-        assert_eq!(state.finalized_root, f.output.finalized_root);
-        assert_eq!(state.latest_state_root, f.output.finalized_state_root);
-        // Strict chaining: the state advances to the END of the proven
-        // transition, so the next finalization must start from here.
-        assert_eq!(
-            state.accumulator_commitment,
-            f.output.next_accumulator_commitment
-        );
-        assert_eq!(state.submission_count as usize, i + 1);
-
-        let (record_key, _) =
-            finalization_record_address(&h.program_id, &h.payer.pubkey(), f.output.finalized_epoch);
-        let record =
-            FinalizationRecord::unpack(&h.svm.get_account(&record_key).unwrap().data).unwrap();
-        assert_eq!(record.finalized_root, f.output.finalized_root);
-        assert_eq!(record.finalized_state_root, f.output.finalized_state_root);
-
-        let (anchor_key, _) = anchor_record_address(
-            &h.program_id,
-            &h.payer.pubkey(),
-            &f.output.finalized_state_root,
-        );
-        let anchor = AnchorRecord::unpack(&h.svm.get_account(&anchor_key).unwrap().data).unwrap();
-        assert_eq!(anchor.finalized_epoch, f.output.finalized_epoch);
-    }
-
-    // The fixtures form a chain: each finalization starts where the previous
-    // one ended. After three, the accumulator sits at the end of the third
-    // transition, one epoch past the last finalized epoch.
+    let state = h.state();
+    assert_eq!(state.finalized_epoch, out.finalized_epoch);
+    assert_eq!(state.finalized_root, out.finalized_root);
+    assert_eq!(state.latest_state_root, out.finalized_state_root);
+    assert_eq!(state.submission_count, 1);
+    // The accumulator moved to the far end of the transition the proof covers,
+    // and the epoch that end belongs to is the one the proof justified.
     assert_eq!(
-        h.state().accumulator_epoch,
-        finalization(2).output.finalized_epoch + 1
+        state.accumulator_commitment,
+        out.next_accumulator_commitment
     );
-    assert_eq!(
-        h.state().accumulator_commitment,
-        finalization(2).output.next_accumulator_commitment
-    );
-    assert_ne!(h.state().accumulator_commitment, bootstrap_acc);
-}
+    assert_eq!(state.accumulator_epoch, out.justified_epoch);
 
-#[test]
-fn rejects_a_tampered_finalized_root() {
-    let mut h = Harness::new();
-    h.initialize();
+    let (record_address, _) =
+        finalization_record_address(&h.program_id, &h.payer.pubkey(), out.finalized_epoch);
+    let record =
+        FinalizationRecord::unpack(&h.svm.get_account(&record_address).unwrap().data).unwrap();
+    assert_eq!(record.finalized_epoch, out.finalized_epoch);
+    assert_eq!(record.finalized_root, out.finalized_root);
+    assert_eq!(record.accumulator_commitment, out.accumulator_commitment);
 
-    let mut f = finalization(0);
-    f.output.finalized_root[0] ^= 1;
-    custom_error(&h.submit(&f), ZkasperError::ProofVerificationFailed);
-}
-
-#[test]
-fn rejects_a_tampered_accumulator_commitment() {
-    let mut h = Harness::new();
-    h.initialize();
-
-    let mut f = finalization(0);
-    f.output.accumulator_commitment[31] ^= 1;
-    custom_error(&h.submit(&f), ZkasperError::ProofVerificationFailed);
-}
-
-#[test]
-fn rejects_a_mangled_proof() {
-    let mut h = Harness::new();
-    h.initialize();
-
-    let mut f = finalization(0);
-    f.c[0] ^= 1;
-    custom_error(&h.submit(&f), ZkasperError::ProofVerificationFailed);
+    let (anchor_address, _) =
+        anchor_record_address(&h.program_id, &h.payer.pubkey(), &out.finalized_state_root);
+    let anchor = AnchorRecord::unpack(&h.svm.get_account(&anchor_address).unwrap().data).unwrap();
+    assert_eq!(anchor.finalized_state_root, out.finalized_state_root);
+    assert_eq!(anchor.finalized_epoch, out.finalized_epoch);
 }
 
 #[test]
 fn rejects_a_replayed_epoch() {
     let mut h = Harness::new();
     h.initialize();
-
-    let f = finalization(0);
-    h.submit(&f).unwrap();
-    custom_error(&h.submit(&f), ZkasperError::EpochNotAdvancing);
+    h.stage();
+    let out = h.f.output;
+    h.submit(&out).unwrap();
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::EpochNotAdvancing);
 }
 
+#[test]
+fn rejects_a_tampered_finalized_root() {
+    let mut h = Harness::new();
+    h.initialize();
+    h.stage();
+    let mut out = h.f.output;
+    out.finalized_root[0] ^= 1;
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::ProofVerificationFailed);
+}
+
+#[test]
+fn rejects_a_tampered_justified_root() {
+    let mut h = Harness::new();
+    h.initialize();
+    h.stage();
+    let mut out = h.f.output;
+    out.justified_root[31] ^= 1;
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::ProofVerificationFailed);
+}
+
+/// A finalization that does not start from the accumulator the client holds is
+/// a branch, and is rejected rather than silently adopted.
+#[test]
+fn rejects_a_finalization_from_a_branched_accumulator() {
+    let mut h = Harness::new();
+    h.initialize();
+    h.stage();
+    let mut out = h.f.output;
+    out.accumulator_commitment[0] ^= 1;
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::AccumulatorMismatch);
+}
+
+/// The same proof, under a light client that pins a different guest key. The
+/// proof is genuine; it is a proof of something this client did not ask for.
 #[test]
 fn rejects_a_proof_bound_to_a_different_guest() {
     let mut h = Harness::new();
-    let b = bootstrap();
-    let mut program_vk = b.program_vk;
-    program_vk[0] ^= 1;
+    let mut other = h.f.program_vk;
+    other[0] ^= 1;
+    h.initialize_with(&other);
+    h.stage();
+    let out = h.f.output;
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::ProofVerificationFailed);
+}
 
-    let instruction = ix::initialize(
-        &h.program_id,
-        &h.payer.pubkey(),
-        &b.accumulator_commitment,
-        &b.latest_state_root,
-        b.finalized_epoch,
-        &b.finalized_root,
-        &program_vk,
-        &b.vk,
+#[test]
+fn rejects_a_submission_with_nothing_staged() {
+    let mut h = Harness::new();
+    h.initialize();
+    let out = h.f.output;
+    let result = h.submit(&out);
+    let Err(failure) = &result else {
+        panic!("a submission with no staged proof succeeded");
+    };
+    // The buffer PDA does not exist, so the runtime never reaches the program.
+    let err = format!("{:?}", failure.err);
+    assert!(
+        err.contains("Custom") || err.contains("AccountNotFound"),
+        "{err}"
     );
-    h.ok(&[instruction]);
+}
 
-    // The proof commits to the real guest key, so the first public input no
-    // longer matches and the pairing fails.
-    custom_error(
-        &h.submit(&finalization(0)),
-        ZkasperError::ProofVerificationFailed,
+/// A submitter can only verify what that submitter staged, so nobody can have a
+/// proof swapped out from under them between the two transactions.
+#[test]
+fn rejects_a_buffer_belonging_to_someone_else() {
+    let mut h = Harness::new();
+    h.initialize();
+    h.stage();
+
+    let stranger = Pubkey::new_from_array([3u8; 32]);
+    let (their_buffer, _) = proof_buffer_address(&h.program_id, &stranger);
+    let out = h.f.output;
+    let mut instruction =
+        ix::submit_finalization(&h.program_id, &h.payer.pubkey(), &h.payer.pubkey(), &out);
+    instruction.accounts[4] = AccountMeta::new_readonly(their_buffer, false);
+    let result = h.send(&[instruction], Some(COMPUTE_UNIT_LIMIT));
+    let Err(failure) = &result else {
+        panic!("a foreign buffer was accepted");
+    };
+    let err = format!("{:?}", failure.err);
+    assert!(
+        err.contains(&format!(
+            "Custom({})",
+            ZkasperError::InvalidProofBuffer as u32
+        )) || err.contains("AccountNotFound"),
+        "{err}"
     );
 }
 
 #[test]
-fn read_path_answers_finalization_queries() {
+fn re_staging_overwrites_and_costs_no_extra_rent() {
     let mut h = Harness::new();
     h.initialize();
-    let f = finalization(0);
-    h.submit(&f).unwrap();
+    h.stage();
+    let (buffer, _) = proof_buffer_address(&h.program_id, &h.payer.pubkey());
+    let first = h.svm.get_account(&buffer).unwrap();
+    assert_eq!(first.data.len(), PROOF_BUFFER_LEN);
+    h.stage();
+    let second = h.svm.get_account(&buffer).unwrap();
+    assert_eq!(first.lamports, second.lamports);
+    assert_eq!(first.data, second.data);
 
+    // And the rent comes back.
+    let before = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
+    let instruction = ix::close_proof_buffer(&h.program_id, &h.payer.pubkey());
+    h.ok(&[instruction]);
+    let after = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
+    assert!(after > before, "closing the buffer refunded nothing");
+    assert!(h.svm.get_account(&buffer).is_none_or(|a| a.lamports == 0));
+}
+
+// ---------------------------------------------------------------------------
+// read path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_path_answers_finalization_and_anchor_queries() {
+    let mut h = Harness::new();
+    h.initialize();
+    h.stage();
+    let out = h.f.output;
+    h.submit(&out).unwrap();
+
+    let authority = h.payer.pubkey();
     h.ok(&[ix::assert_finalized(
         &h.program_id,
-        &h.payer.pubkey(),
-        f.output.finalized_epoch,
-        &f.output.finalized_root,
+        &authority,
+        out.finalized_epoch,
+        &out.finalized_root,
     )]);
-
-    let mut wrong_root = f.output.finalized_root;
-    wrong_root[0] ^= 1;
-    custom_error(
-        &h.send_with_limit(
-            400_000,
-            &[ix::assert_finalized(
-                &h.program_id,
-                &h.payer.pubkey(),
-                f.output.finalized_epoch,
-                &wrong_root,
-            )],
-        ),
-        ZkasperError::CheckpointNotFinalized,
-    );
-
-    // An epoch nobody proved has no record account at all.
-    custom_error(
-        &h.send_with_limit(
-            400_000,
-            &[ix::assert_finalized(
-                &h.program_id,
-                &h.payer.pubkey(),
-                999_999,
-                &f.output.finalized_root,
-            )],
-        ),
-        ZkasperError::InvalidRecordAccount,
-    );
-}
-
-#[test]
-fn read_path_answers_anchor_queries() {
-    let mut h = Harness::new();
-    h.initialize();
-    let f = finalization(0);
-    h.submit(&f).unwrap();
-
     h.ok(&[ix::assert_anchored(
         &h.program_id,
-        &h.payer.pubkey(),
-        &f.output.finalized_state_root,
+        &authority,
+        &out.finalized_state_root,
     )]);
 
-    // The bootstrap state root was trusted, not proved, so it is not anchored.
-    custom_error(
-        &h.send_with_limit(
-            400_000,
-            &[ix::assert_anchored(
-                &h.program_id,
-                &h.payer.pubkey(),
-                &bootstrap().latest_state_root,
-            )],
-        ),
-        ZkasperError::StateRootNotAnchored,
+    let mut wrong = out.finalized_root;
+    wrong[0] ^= 1;
+    let result = h.send(
+        &[ix::assert_finalized(
+            &h.program_id,
+            &authority,
+            out.finalized_epoch,
+            &wrong,
+        )],
+        Some(COMPUTE_UNIT_LIMIT),
     );
+    custom_error(&result, ZkasperError::CheckpointNotFinalized);
+
+    let mut unknown = out.finalized_state_root;
+    unknown[0] ^= 1;
+    // The PDA for a state root nothing anchored does not exist, so the runtime
+    // hands the program an empty account the system program owns.
+    let result = h.send(
+        &[ix::assert_anchored(&h.program_id, &authority, &unknown)],
+        Some(COMPUTE_UNIT_LIMIT),
+    );
+    custom_error(&result, ZkasperError::StateRootNotAnchored);
 }
 
 // ---------------------------------------------------------------------------
-// compute units
+// what it costs
 // ---------------------------------------------------------------------------
 
-/// Prints the measured cost of every path, and pins the numbers so a regression
-/// in the verifier or the account layout shows up as a test failure.
 #[test]
 fn measures_compute_units() {
     let mut h = Harness::new();
-    let init = h.initialize();
-    let f = finalization(0);
+    let init = h.initialize().compute_units_consumed;
+    let stage = h.stage().compute_units_consumed;
 
+    let out = h.f.output;
     let verify_only = h
-        .send_with_limit(
-            400_000,
+        .send(
             &[ix::verify_only(
                 &h.program_id,
                 &h.payer.pubkey(),
-                &f.a,
-                &f.b,
-                &f.c,
-                &f.output,
+                &h.payer.pubkey(),
+                &out,
             )],
+            Some(COMPUTE_UNIT_LIMIT),
         )
         .unwrap()
         .compute_units_consumed;
-
-    let submit = h.submit(&f).unwrap().compute_units_consumed;
+    let submit = h.submit(&out).unwrap().compute_units_consumed;
     let read = h
-        .send_with_limit(
-            400_000,
+        .send(
             &[ix::assert_finalized(
                 &h.program_id,
                 &h.payer.pubkey(),
-                f.output.finalized_epoch,
-                &f.output.finalized_root,
+                out.finalized_epoch,
+                &out.finalized_root,
             )],
+            Some(COMPUTE_UNIT_LIMIT),
         )
         .unwrap()
         .compute_units_consumed;
@@ -478,79 +458,258 @@ fn measures_compute_units() {
     // Each transaction also runs one ComputeBudget instruction, which the
     // runtime charges 150 units for.
     println!("compute units (whole transaction, includes 150 for ComputeBudget)");
-    println!("  initialize          {:>7}", init.compute_units_consumed);
-    println!("  verify_only         {:>7}", verify_only);
-    println!("  submit_finalization {:>7}", submit);
-    println!("  assert_finalized    {:>7}", read);
-    // Solana's published syscall prices: one pairing of four pairs, plus one
-    // scalar multiplication and one point addition per public input.
-    const SYSCALL_FLOOR: u64 = 36_364 + 3 * 12_121 + 2 * 3_840 + 2 * 334;
-    println!("  BN254 syscall floor {SYSCALL_FLOOR:>7}");
+    println!("  initialize            {init:>7}");
+    println!("  stage_proof           {stage:>7}");
+    println!("  verify_only           {verify_only:>7}");
+    println!("  submit_finalization   {submit:>7}");
+    println!("  assert_finalized      {read:>7}");
+    // Solana's published syscall prices: eighteen scalar multiplications,
+    // eighteen point additions, and one pairing of two pairs.
+    const SYSCALL_FLOOR: u64 = 18 * 3_840 + 18 * 334 + 36_364 + 2 * 12_121;
+    println!("  BN254 syscall floor   {SYSCALL_FLOOR:>7}");
     println!(
-        "  everything else     {:>7}",
+        "  everything else       {:>7}",
         submit.saturating_sub(SYSCALL_FLOOR)
     );
+    println!("  budget requested      {COMPUTE_UNIT_LIMIT:>7}");
 
     assert!(
-        verify_only < 200_000,
-        "verification cost regressed: {verify_only}"
+        submit < COMPUTE_UNIT_LIMIT as u64,
+        "a submission no longer fits the budget it asks for: {submit}"
     );
-    assert!(submit < 300_000, "submission cost regressed: {submit}");
+    assert!(stage < 20_000, "staging cost regressed: {stage}");
     assert!(read < 10_000, "read path cost regressed: {read}");
 }
 
+/// What the two transactions leave behind, in lamports.
+///
+/// Compute units are not the bill. Rent is: the records are permanent, and the
+/// staging buffer is not.
+#[test]
+fn measures_lamports() {
+    let mut h = Harness::new();
+    let before_init = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
+    h.initialize();
+    let after_init = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
+    h.stage();
+    let (buffer, _) = proof_buffer_address(&h.program_id, &h.payer.pubkey());
+    let staged = h.svm.get_account(&buffer).unwrap().lamports;
+    let after_stage = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
+
+    let out = h.f.output;
+    h.submit(&out).unwrap();
+    let after_submit = h.svm.get_account(&h.payer.pubkey()).unwrap().lamports;
+    let record = h
+        .svm
+        .get_account(
+            &finalization_record_address(&h.program_id, &h.payer.pubkey(), out.finalized_epoch).0,
+        )
+        .unwrap()
+        .lamports;
+    let anchor = h
+        .svm
+        .get_account(
+            &anchor_record_address(&h.program_id, &h.payer.pubkey(), &out.finalized_state_root).0,
+        )
+        .unwrap()
+        .lamports;
+
+    println!("\nlamports");
+    println!(
+        "  initialize, once          {:>10}",
+        before_init - after_init
+    );
+    println!(
+        "  stage_proof               {:>10}",
+        after_init - after_stage
+    );
+    println!("    of which buffer rent    {staged:>10}  (refundable)");
+    println!(
+        "  submit_finalization       {:>10}",
+        after_stage - after_submit
+    );
+    println!("    finalization record     {record:>10}");
+    println!("    anchor record           {anchor:>10}");
+    println!(
+        "  per submission, net of the refund {:>10}",
+        (after_init - after_submit) - staged
+    );
+}
+
 /// A transaction with no `ComputeBudgetProgram` instruction gets 200,000 units.
-/// Whether that is enough decides if submitters must raise the limit explicitly.
 #[test]
 fn behaviour_under_the_default_compute_budget() {
     let mut h = Harness::new();
     h.initialize();
-    let f = finalization(0);
-    let instruction = ix::submit_finalization(
-        &h.program_id,
-        &h.payer.pubkey(),
-        &h.payer.pubkey(),
-        &f.a,
-        &f.b,
-        &f.c,
-        &f.output,
-    );
-
-    match h.send_raw(&[instruction]) {
-        Ok(meta) => println!(
-            "submit_finalization fits the 200,000-unit default: {} units",
+    h.stage();
+    let out = h.f.output;
+    let instruction =
+        ix::submit_finalization(&h.program_id, &h.payer.pubkey(), &h.payer.pubkey(), &out);
+    match h.send(&[instruction], None) {
+        Ok(meta) => panic!(
+            "a PLONK submission now fits the 200,000-unit default at {} units; the \
+             ComputeBudget instruction is no longer needed",
             meta.compute_units_consumed
         ),
-        Err(e) => panic!(
-            "submit_finalization exceeds the default budget; clients must call \
-             ComputeBudgetInstruction::set_compute_unit_limit. err: {:?}",
+        Err(e) => println!(
+            "a PLONK submission exceeds the 200,000-unit default, so every submitter \
+             must raise it: {:?}",
             e.err
         ),
     }
 }
 
-/// A finalization that does not start from the accumulator the client holds is
-/// a branch, and must be rejected rather than silently adopted.
+// ---------------------------------------------------------------------------
+// what it weighs
+// ---------------------------------------------------------------------------
+
+fn size(tx: &Transaction) -> u64 {
+    bincode::serialized_size(tx).unwrap()
+}
+
+/// The two transactions a submission takes, measured, plus the single-transaction
+/// designs that do not fit.
+///
+/// A PLONK proof is 768 bytes. Carrying it inline beside the 176-byte output
+/// overruns Solana's 1,232-byte packet, and the only way to claw that back is an
+/// address lookup table — which cannot hold the record and anchor PDAs, because
+/// those are new every epoch and a table's addresses are unusable until the slot
+/// after they are added. Staging pays the same two transactions and needs no
+/// table at all.
 #[test]
-fn rejects_a_finalization_from_a_branched_accumulator() {
+fn what_a_submission_weighs() {
     let mut h = Harness::new();
     h.initialize();
 
-    let mut f = finalization(0);
-    // Same valid proof, but claim it starts somewhere the client has never been.
-    f.output.accumulator_commitment = [0xAB; 32];
+    let proof = proof_array(&h.f);
+    let out = h.f.output;
+    let payer = h.payer.pubkey();
 
-    let err = h
-        .submit(&f)
-        .expect_err("a finalization from an unknown accumulator must be rejected");
-    let logs = err.meta.pretty_logs();
-    assert!(
-        logs.contains("does not hold") || format!("{:?}", err.err).contains("Custom"),
-        "expected an accumulator mismatch, got: {}",
-        logs
+    let stage = h.transaction(
+        &[ix::stage_proof(&h.program_id, &payer, &proof)],
+        Some(COMPUTE_UNIT_LIMIT),
+    );
+    let submit = h.transaction(
+        &[ix::submit_finalization(&h.program_id, &payer, &payer, &out)],
+        Some(COMPUTE_UNIT_LIMIT),
     );
 
-    // State must be untouched.
-    let state = h.state();
-    assert_eq!(state.submission_count, 0);
+    println!("\nserialized transaction bytes (packet limit {PACKET_LIMIT})");
+    println!("  1. stage_proof          {:>5}", size(&stage));
+    println!("  2. submit_finalization  {:>5}", size(&submit));
+
+    // The counterfactual: one transaction carrying tag, proof and output, with
+    // the five accounts `submit_finalization` names.
+    let inline = Instruction {
+        program_id: h.program_id,
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(light_client_address(&h.program_id, &payer).0, false),
+            AccountMeta::new(
+                finalization_record_address(&h.program_id, &payer, out.finalized_epoch).0,
+                false,
+            ),
+            AccountMeta::new(
+                anchor_record_address(&h.program_id, &payer, &out.finalized_state_root).0,
+                false,
+            ),
+            AccountMeta::new_readonly(solana_system_interface_id(), false),
+        ],
+        data: {
+            let mut data = Vec::with_capacity(1 + PROOF_LEN + FINALIZATION_PUBLIC_BYTES);
+            data.push(ix::IX_SUBMIT_FINALIZATION);
+            data.extend_from_slice(&proof);
+            data.extend_from_slice(&out.public_bytes());
+            data
+        },
+    };
+    let legacy = h.transaction(std::slice::from_ref(&inline), Some(COMPUTE_UNIT_LIMIT));
+    println!(
+        "\n  one legacy transaction, proof inline            {:>5}  {}",
+        size(&legacy),
+        verdict(size(&legacy))
+    );
+
+    // The same instruction in a v0 transaction. `try_compile` keeps signers and
+    // invoked program ids in the static keys whatever the table offers, so what
+    // a table can save is one byte per remaining account instead of thirty-two.
+    let table_key = Pubkey::new_from_array([42u8; 32]);
+    let fixed = vec![
+        light_client_address(&h.program_id, &payer).0,
+        solana_system_interface_id(),
+    ];
+    let mut per_epoch = fixed.clone();
+    per_epoch.push(finalization_record_address(&h.program_id, &payer, out.finalized_epoch).0);
+    per_epoch.push(anchor_record_address(&h.program_id, &payer, &out.finalized_state_root).0);
+
+    for (what, addresses) in [
+        ("v0, table holds the fixed accounts   ", fixed),
+        ("v0, table also holds record + anchor ", per_epoch),
+    ] {
+        let table = AddressLookupTableAccount {
+            key: table_key,
+            addresses,
+        };
+        let msg = v0::Message::try_compile(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
+                inline.clone(),
+            ],
+            &[table],
+            h.svm.latest_blockhash(),
+        )
+        .expect("compile v0");
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&h.payer]).unwrap();
+        let bytes = bincode::serialized_size(&tx).unwrap();
+        println!("  {what}          {bytes:>5}  {}", verdict(bytes));
+    }
+
+    assert!(size(&stage) <= PACKET_LIMIT, "staging no longer fits");
+    assert!(size(&submit) <= PACKET_LIMIT, "submission no longer fits");
+    assert!(
+        size(&legacy) > PACKET_LIMIT,
+        "an inline PLONK submission now fits a legacy transaction; the blocker is gone"
+    );
+}
+
+fn verdict(bytes: u64) -> &'static str {
+    if bytes <= PACKET_LIMIT {
+        "fits"
+    } else {
+        "OVER"
+    }
+}
+
+fn solana_system_interface_id() -> Pubkey {
+    Pubkey::new_from_array([0u8; 32])
+}
+
+/// The lookup-table route works, and it still needs a transaction in an earlier
+/// slot to put this epoch's record and anchor addresses in the table.
+#[test]
+fn the_lookup_table_route_needs_the_table_to_exist_first() {
+    let mut h = Harness::new();
+    h.initialize();
+    let payer = h.payer.pubkey();
+    let out = h.f.output;
+
+    let _table_key = Pubkey::new_from_array([42u8; 32]);
+    let addresses = vec![
+        light_client_address(&h.program_id, &payer).0,
+        finalization_record_address(&h.program_id, &payer, out.finalized_epoch).0,
+    ];
+    let data = AddressLookupTable {
+        meta: LookupTableMeta::default(),
+        addresses: std::borrow::Cow::Owned(addresses.clone()),
+    }
+    .serialize_for_tests()
+    .unwrap();
+    println!(
+        "a lookup table holding {} addresses is {} bytes of account state, and every \
+         new epoch needs two more of them added a slot ahead of the submission",
+        addresses.len(),
+        data.len()
+    );
+    assert!(data.len() > 32 * addresses.len());
 }

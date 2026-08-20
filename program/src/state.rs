@@ -8,35 +8,62 @@
 use solana_program::pubkey::Pubkey;
 
 use crate::error::ZkasperError;
+use crate::plonk::PROOF_LEN;
 use crate::wire::{AccumulatorCommitment, ProgramVk};
 
 pub const TAG_LIGHT_CLIENT: u8 = 1;
 pub const TAG_FINALIZATION_RECORD: u8 = 2;
 pub const TAG_ANCHOR_RECORD: u8 = 3;
+pub const TAG_PROOF_BUFFER: u8 = 4;
 
 pub const SEED_STATE: &[u8] = b"zkasper-state";
 pub const SEED_FINALIZATION: &[u8] = b"zkasper-fin";
 pub const SEED_ANCHOR: &[u8] = b"zkasper-anchor";
 
 // ---------------------------------------------------------------------------
-// Groth16 verifying key
+// Proof buffer
 // ---------------------------------------------------------------------------
 
-/// Number of public inputs the wrap circuit exposes: the guest program key and
-/// the digest of the finalization output.
-pub const NUM_PUBLIC_INPUTS: usize = 2;
+pub const SEED_PROOF: &[u8] = b"zkasper-proof";
 
-/// `vk_ic` has one point per public input, plus the constant term.
-pub const VK_IC_LEN: usize = NUM_PUBLIC_INPUTS + 1;
+const BUF_OFF_TAG: usize = 0;
+const BUF_OFF_BUMP: usize = 1;
+/// Offset of the staged PLONK proof.
+pub const BUF_OFF_PROOF: usize = 2;
 
-/// alpha_g1 (64) + three G2 points (128 each) + `VK_IC_LEN` G1 points (64 each).
-pub const VK_LEN: usize = 64 + 128 * 3 + 64 * VK_IC_LEN;
+pub const PROOF_BUFFER_LEN: usize = BUF_OFF_PROOF + PROOF_LEN;
 
-pub const VK_OFF_ALPHA_G1: usize = 0;
-pub const VK_OFF_BETA_G2: usize = 64;
-pub const VK_OFF_GAMMA_G2: usize = 192;
-pub const VK_OFF_DELTA_G2: usize = 320;
-pub const VK_OFF_IC: usize = 448;
+/// Scratch space one submitter uses to carry a proof between two transactions.
+///
+/// A PLONK proof is 768 bytes and a Solana packet is 1,232, so a submission
+/// that carries the proof, the finalization output and seven account keys does
+/// not fit — see `README.md`, "Two transactions". `StageProof` writes the proof
+/// here and `SubmitFinalization` reads it back.
+///
+/// The buffer is a PDA of the submitter, so only that submitter can write it and
+/// nobody can swap a proof out from under a pending submission. Its contents are
+/// never trusted: a proof either verifies against the pinned key and the claimed
+/// output or it does not.
+pub fn write_proof(data: &mut [u8], bump: u8, proof: &[u8; PROOF_LEN]) -> Result<(), ZkasperError> {
+    if data.len() < PROOF_BUFFER_LEN {
+        return Err(ZkasperError::AccountDataTooSmall);
+    }
+    data[BUF_OFF_TAG] = TAG_PROOF_BUFFER;
+    data[BUF_OFF_BUMP] = bump;
+    data[BUF_OFF_PROOF..BUF_OFF_PROOF + PROOF_LEN].copy_from_slice(proof);
+    Ok(())
+}
+
+/// The staged proof, read in place.
+pub fn staged_proof(data: &[u8]) -> Result<&[u8], ZkasperError> {
+    if data.len() < PROOF_BUFFER_LEN {
+        return Err(ZkasperError::AccountDataTooSmall);
+    }
+    if data[BUF_OFF_TAG] != TAG_PROOF_BUFFER {
+        return Err(ZkasperError::WrongAccountTag);
+    }
+    Ok(&data[BUF_OFF_PROOF..BUF_OFF_PROOF + PROOF_LEN])
+}
 
 // ---------------------------------------------------------------------------
 // LightClientState
@@ -52,12 +79,10 @@ const OFF_FINALIZED_ROOT: usize = 106;
 const OFF_PROGRAM_VK: usize = 138;
 const OFF_SUBMISSION_COUNT: usize = 170;
 const OFF_ACC_EPOCH: usize = 178;
-/// Offset of the embedded Groth16 verifying key.
-pub const OFF_VK: usize = 186;
 
-pub const LIGHT_CLIENT_LEN: usize = OFF_VK + VK_LEN;
+pub const LIGHT_CLIENT_LEN: usize = 186;
 
-/// The light-client state, minus the verifying key, which is read in place.
+/// The light-client state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LightClientState {
     pub bump: u8,
@@ -68,7 +93,15 @@ pub struct LightClientState {
     pub latest_state_root: [u8; 32],
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
-    /// Zisk verification key of the finalization guest, bound at bootstrap.
+    /// Zisk verification key of the finalization guest, bound at bootstrap and
+    /// never mutable.
+    ///
+    /// This is one of the two halves of the statement the wrap proves — see
+    /// [`crate::plonk::public_input`]. It is deployment configuration rather
+    /// than a compile-time constant because the guest is zkasper's and changes
+    /// on zkasper's schedule, while the circuit constants in
+    /// [`crate::plonk::vk`] are Zisk's. Scoping the state account by authority
+    /// means "which guest do you trust" is answered by naming an authority.
     pub program_vk: ProgramVk,
     pub submission_count: u64,
     /// Epoch whose proof last changed `accumulator_commitment`.
@@ -104,7 +137,6 @@ impl LightClientState {
         })
     }
 
-    /// Writes the header. The verifying key past [`OFF_VK`] is left alone.
     pub fn pack_into(&self, data: &mut [u8]) -> Result<(), ZkasperError> {
         if data.len() < LIGHT_CLIENT_LEN {
             return Err(ZkasperError::AccountDataTooSmall);
@@ -280,4 +312,9 @@ pub fn anchor_record_address(
     state_root: &[u8; 32],
 ) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_ANCHOR, authority.as_ref(), state_root], program_id)
+}
+
+/// The staging buffer belonging to one submitter.
+pub fn proof_buffer_address(program_id: &Pubkey, payer: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_PROOF, payer.as_ref()], program_id)
 }

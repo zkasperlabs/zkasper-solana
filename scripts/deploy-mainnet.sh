@@ -45,11 +45,15 @@ cat <<'NOTE'
 
 Before Initialize, confirm all of the following:
 
-1. The Groth16 verifying key and the Zisk `program_vk` are a MATCHED PAIR from
-   the same wrap. Nothing on chain checks this. A mismatched pair verifies
-   proofs of the wrong statement and fails open.
-2. The Groth16 trusted setup was a multi-party ceremony. A single-participant
-   setup means one party can forge any finalization, whatever this program does.
+1. The `program_vk` you are about to bind is the finalization guest zkasper is
+   actually running, and the circuit constants in `program/src/plonk/vk.rs` are
+   the Zisk release its proofs are wrapped under. Nothing on chain checks either.
+   Both mismatches fail closed -- proofs stop verifying -- but they fail at
+   submission time, not now.
+2. You accept the PLONK wrap's trusted setup. Zisk ships `provingKeySnark` as a
+   prebuilt 21.9 GB `final.zkey` with an md5 and no ceremony transcript. Whoever
+   generated it can forge any finalization, whatever this program does. The STARK
+   underneath is transparent; this step is not.
 3. The bootstrap checkpoint is a weak-subjectivity checkpoint you independently
    verified, not one taken from an RPC you do not control.
 4. `Initialize` is first-come per authority. Run it in the same session as the

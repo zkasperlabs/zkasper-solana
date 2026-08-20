@@ -4,12 +4,17 @@
 //! proofs. See `scripts/demo.sh`.
 //!
 //! ```text
-//! zkasper-cli <rpc-url> <keypair.json> init             <fixtures-dir>
-//! zkasper-cli <rpc-url> <keypair.json> submit           <fixtures-dir> <index>
+//! zkasper-cli <rpc-url> <keypair.json> init             <wrap.json>
+//! zkasper-cli <rpc-url> <keypair.json> stage            <wrap.json>
+//! zkasper-cli <rpc-url> <keypair.json> submit           <wrap.json>
+//! zkasper-cli <rpc-url> <keypair.json> close-buffer
 //! zkasper-cli <rpc-url> <keypair.json> show
 //! zkasper-cli <rpc-url> <keypair.json> assert-finalized <epoch> <root-hex>
 //! zkasper-cli <rpc-url> <keypair.json> assert-anchored  <state-root-hex>
 //! ```
+//!
+//! A submission is `stage` then `submit`: the proof is 768 bytes and does not
+//! fit a packet beside the output it attests to.
 //!
 //! `submit` also writes a *posting record* — the object `docs/api-v1.md` in the
 //! zkasper repository calls `posting` — to stdout, and appends it to the file
@@ -31,12 +36,14 @@ use solana_transaction::Transaction;
 use serde_json::{json, Value};
 
 use zkasper_solana_program::instruction as ix;
-use zkasper_solana_program::state::{light_client_address, LightClientState, VK_LEN};
-use zkasper_solana_program::wire::FinalizationOutput;
+use zkasper_solana_program::plonk::PROOF_LEN;
+use zkasper_solana_program::state::{light_client_address, LightClientState};
+use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// Measured at 99,033 units for the whole transaction; this leaves headroom
-/// without overpaying for priority.
-const COMPUTE_UNIT_LIMIT: u32 = 130_000;
+/// A submission measures 479,423 units for the whole transaction; this leaves
+/// headroom without overpaying for a limit the runtime reserves block space
+/// against. Staging costs 4,872 and rides the same limit.
+const COMPUTE_UNIT_LIMIT: u32 = 700_000;
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -59,8 +66,43 @@ fn read_keypair(path: &str) -> Keypair {
     Keypair::try_from(bytes.as_slice()).unwrap_or_else(|_| die("keypair must be 64 bytes"))
 }
 
-fn a32(buf: &[u8], off: usize) -> [u8; 32] {
-    buf[off..off + 32].try_into().unwrap()
+/// One hex field of a `cargo-zisk wrap --plonk` artifact.
+fn wrap_field(raw: &str, name: &str) -> Vec<u8> {
+    let at = raw
+        .find(name)
+        .unwrap_or_else(|| die(&format!("no {name} in the wrap artifact")))
+        + name.len();
+    let rest = &raw[at..];
+    let start = rest.find("0x").unwrap_or_else(|| die("expected hex")) + 2;
+    let end = rest[start..]
+        .find('"')
+        .unwrap_or_else(|| die("unterminated hex"))
+        + start;
+    hex::decode(&rest[start..end]).unwrap_or_else(|e| die(&e.to_string()))
+}
+
+struct Wrap {
+    program_vk: [u8; 32],
+    proof: [u8; PROOF_LEN],
+    output: FinalizationOutput,
+}
+
+fn read_wrap(path: &str) -> Wrap {
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let publics = wrap_field(&raw, "publicValues");
+    let head: [u8; FINALIZATION_PUBLIC_BYTES] = publics
+        .get(..FINALIZATION_PUBLIC_BYTES)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or_else(|| die("publicValues is shorter than one finalization output"));
+    Wrap {
+        program_vk: wrap_field(&raw, "programVK")
+            .try_into()
+            .unwrap_or_else(|_| die("programVK must be 32 bytes")),
+        proof: wrap_field(&raw, "proofBytes")
+            .try_into()
+            .unwrap_or_else(|_| die("proofBytes must be 768 bytes")),
+        output: FinalizationOutput::from_public_bytes(&head),
+    }
 }
 
 fn parse_root(s: &str) -> [u8; 32] {
@@ -134,9 +176,10 @@ fn u64_at(value: &Value, path: &[&str]) -> u64 {
 ///
 /// `fee_lamports` is the transaction fee. `rent_lamports` is what the payer
 /// left behind as the rent-exempt balance of the finalization and anchor
-/// records, which is the larger number and is not refundable — the program has
-/// no instruction that closes an account. Reporting only the fee would make the
-/// posting cheaper than it is.
+/// records, which is the larger number and is not refundable. The staging
+/// buffer's rent is refundable — `close-buffer` — and is not counted here, but
+/// the staging transaction's own fee is not part of this number either.
+/// Reporting only the fee would make the posting cheaper than it is.
 fn posting(client: &RpcClient, signature: &str, output: &FinalizationOutput) -> String {
     let tx = receipt(client, signature);
     let meta = &tx["meta"];
@@ -205,52 +248,60 @@ fn main() {
 
     match args[2].as_str() {
         "init" => {
-            let dir = args.get(3).map(String::as_str).unwrap_or("fixtures");
-            let blob = std::fs::read(format!("{dir}/bootstrap.bin"))
-                .unwrap_or_else(|e| die(&format!("{dir}/bootstrap.bin: {e}")));
-            let vk: [u8; VK_LEN] = blob[136..136 + VK_LEN].try_into().unwrap();
+            let path = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("fixtures/wrap-469426.json");
+            let wrap = read_wrap(path);
+            // Bootstrap one epoch below the proof, on the accumulator it starts
+            // from, so the demo has something the proof can advance. A real
+            // deployment takes these from a checkpoint the operator trusts.
             send(
                 &client,
                 &payer,
                 ix::initialize(
                     &program_id,
                     &authority,
-                    &a32(&blob, 0),
-                    &a32(&blob, 32),
-                    u64::from_le_bytes(blob[64..72].try_into().unwrap()),
-                    &a32(&blob, 72),
-                    &a32(&blob, 104),
-                    &vk,
+                    &wrap.output.accumulator_commitment,
+                    &[0u8; 32],
+                    wrap.output.finalized_epoch - 1,
+                    &[0u8; 32],
+                    &wrap.program_vk,
                 ),
             );
         }
+        "stage" => {
+            let path = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("fixtures/wrap-469426.json");
+            let wrap = read_wrap(path);
+            send(
+                &client,
+                &payer,
+                ix::stage_proof(&program_id, &payer.pubkey(), &wrap.proof),
+            );
+        }
         "submit" => {
-            let dir = args.get(3).map(String::as_str).unwrap_or("fixtures");
-            let index = args.get(4).map(String::as_str).unwrap_or("0");
-            let path = format!("{dir}/finalization_{index}.bin");
-            let blob = std::fs::read(&path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-            let output = FinalizationOutput {
-                accumulator_commitment: a32(&blob, 256),
-                next_accumulator_commitment: a32(&blob, 288),
-                finalized_epoch: u64::from_le_bytes(blob[320..328].try_into().unwrap()),
-                finalized_root: a32(&blob, 328),
-                finalized_state_root: a32(&blob, 360),
-            };
-            println!("submitting epoch {}", output.finalized_epoch);
+            let path = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("fixtures/wrap-469426.json");
+            let wrap = read_wrap(path);
+            println!("submitting epoch {}", wrap.output.finalized_epoch);
             let signature = send(
                 &client,
                 &payer,
-                ix::submit_finalization(
-                    &program_id,
-                    &authority,
-                    &payer.pubkey(),
-                    blob[0..64].try_into().unwrap(),
-                    blob[64..192].try_into().unwrap(),
-                    blob[192..256].try_into().unwrap(),
-                    &output,
-                ),
+                ix::submit_finalization(&program_id, &authority, &payer.pubkey(), &wrap.output),
             );
-            record_posting(&posting(&client, &signature, &output));
+            record_posting(&posting(&client, &signature, &wrap.output));
+        }
+        "close-buffer" => {
+            send(
+                &client,
+                &payer,
+                ix::close_proof_buffer(&program_id, &payer.pubkey()),
+            );
         }
         "show" => {
             let (address, _) = light_client_address(&program_id, &authority);

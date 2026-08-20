@@ -1,10 +1,18 @@
-//! The v1.0.0-alpha Zisk PLONK verifying key, transcribed from
-//! `zisk-contracts/PlonkVerifier.sol` at Zisk `4b9f758f`.
+//! The Zisk **v1.0.0-alpha** wrap circuit, and everything else that names a
+//! Zisk release.
 //!
-//! The selector and permutation commitments differ between Zisk releases —
-//! v1.1.0-alpha's `Qm..Qc`/`S1..S3` are entirely different points — so an
-//! on-chain verifier is pinned to a Zisk version as well as to a guest. These
-//! are the constants that match the wrapped proof in `tests/`.
+//! Transcribed from `zisk-contracts/PlonkVerifier.sol` at Zisk `4b9f758f`. This
+//! module is the single place in the tree that pins a Zisk version: the
+//! selector and permutation commitments differ between releases — v1.1.0-alpha's
+//! `Qm..Qc`/`S1..S3` are entirely different points — and so do
+//! [`ROOT_C_VADCOP_FINAL`] and the width of the public window. Change one of
+//! them and you must change all of them, which is why they live together rather
+//! than being spread over the verifier, the wire format and the fixtures.
+//!
+//! A deployment is therefore pinned to a Zisk release by its *code*, and to a
+//! zkasper guest by its *state* (see
+//! [`crate::state::LightClientState::program_vk`]). Moving to a new Zisk
+//! release is a program upgrade; moving to a new guest is a new light client.
 
 /// A G1 point in the EIP-197 big-endian encoding the syscalls take: `x || y`.
 pub type G1 = [u8; 64];
@@ -117,3 +125,28 @@ pub const W1: [u8; 32] = [
 /// Number of public inputs. Zisk commits exactly one: the SHA-256 of
 /// `programVK || publicValues || rootCVadcopFinal`, reduced mod r.
 pub const N_PUBLIC: usize = 1;
+
+/// `rootCVadcopFinal`: the VADCOP final verification key the recursion
+/// terminates at, hashed into the wrap's single public input.
+///
+/// This is not the guest key. It names the STARK verifier that checked the
+/// zkasper proof, so a verifier that let a submitter choose it would accept a
+/// proof recursed through a verifier the submitter set up. It is pinned here,
+/// beside the circuit constants it ships with.
+///
+/// v1.0.0-alpha stamps the vadcop_final verkey here; v1.1.0-alpha stamps the
+/// proof's own program key instead, which is a different preimage as well as a
+/// different value.
+pub const ROOT_C_VADCOP_FINAL: [u8; 32] = [
+    0xe3, 0xd9, 0x7c, 0x4d, 0xfb, 0xa6, 0xc9, 0xa6, 0x25, 0x3b, 0xa5, 0xa8, 0x66, 0xfe, 0x16, 0xcc,
+    0x82, 0xc0, 0x91, 0x42, 0x98, 0x52, 0x4e, 0x94, 0x61, 0xe3, 0x03, 0xab, 0xde, 0xcd, 0x7f, 0xcc,
+];
+
+/// Width of the public window the wrap hashes.
+///
+/// Zisk commits guest output into a fixed 64-slot window, zero-padded, and
+/// `export-solidity-calldata` renders it as **256** bytes on v1.0.0-alpha (the
+/// u32 view) and **512** on v1.1.0-alpha (the u64 view). The preimage differs
+/// between the two, so this width is as much a part of the release pin as the
+/// commitments above. 256 is the one the fixture in `fixtures/` verifies under.
+pub const PUBLIC_VALUES_LEN: usize = 256;

@@ -1,60 +1,68 @@
 # Fixtures
 
-**Nothing here is a zkasper proof.**
+`wrap-469426.json` is a real `cargo-zisk wrap --plonk` output: a 768-byte BN254
+PLONK proof, the 256-byte public window it commits to, the guest key it was
+produced under, and the `rootCVadcopFinal` of the Zisk release that made it. The
+tests verify it — off chain in `program-tests/tests/plonk.rs`, and through the
+compiled SBF program in `program-tests/tests/verifier.rs`.
 
-zkasper's STARK-to-Groth16 wrap has never been run. No proof of Ethereum
-finality exists in this format yet, so there was nothing real to check the
-program against. These files are the substitute.
-
-## What they are
-
-`zkasper-fixture-gen` runs a real Groth16 trusted setup over BN254 and produces
-real proofs. The trusted setup, the proving key, the pairing check the program
-performs on chain — all genuine. What is fake is the *statement*. The circuit is:
+**It is not a proof of Ethereum finality.** The guest is a stand-in:
 
 ```rust
-// fixture-gen/src/main.rs
-let a   = cs.new_input_variable(|| Ok(self.pi0))?;   // public
-let b   = cs.new_input_variable(|| Ok(self.pi1))?;   // public
-let sum = cs.new_witness_variable(|| Ok(self.pi0 + self.pi1))?;
-cs.enforce_constraint(lc!() + a + b, lc!() + Variable::One, lc!() + sum)?;
+// the whole program
+fn main() {
+    let input = ziskos::io::read_slice();
+    ziskos::io::commit_slice(input);
+}
 ```
 
-It proves that two numbers add up. It says nothing about Ethereum, Casper FFG,
-validator sets or accumulators.
+It commits its input verbatim, and the input it was given is the 176 bytes
+`/v1/proofs/469426` published — the real `StreamFinalOutput` of a real zkasper
+run, epoch 469425. So the *bytes* are real and the *claim about them* is not:
+this proof says "some Zisk execution of program `0xe4322cd5…` produced these
+public values", which is true, and says nothing about Casper FFG.
 
 ## Why that is still worth having
 
-Groth16 verification cost does not depend on what the circuit proves. It depends
-only on the number of public inputs, which is fixed at two. So the compute-unit
-figures measured against these fixtures are the figures a real proof will cost,
-to the unit.
-
-The same goes for correctness of the plumbing: byte layouts, public-input
-derivation, the negation of `proof_a`, the verifying-key encoding, PDA
-derivation, replay rejection. All of it is exercised for real.
+Zisk's wrap circuits are fixed size and never look at the guest — every zkasper
+proof is 254,624 bytes whatever stage produced it — so a wrap of this guest has
+the same shape, the same verifying key and the same cost as a wrap of the real
+one. What the tests exercise is therefore exactly what a real proof exercises:
+the transcript, the eighteen scalar multiplications, the pairing, the public
+input derivation, the staging buffer, the account plumbing, the accumulator
+chaining, and the compute-unit and transaction-size numbers the README quotes.
 
 What is *not* exercised is whether zkasper's circuits are sound. That question
 lives in the zkasper repository.
 
-## Files
+It is also the reason the program pins `programVK` in account data rather than
+letting a submitter name it. This fixture is precisely the attack that pinning
+prevents: a genuine proof of a guest that asserts nothing. A light client
+bootstrapped on the real finalization guest rejects it, and
+`rejects_a_proof_bound_to_a_different_guest` is that test.
 
-| File | Contents |
-| --- | --- |
-| `vk.bin` | 640-byte Groth16 verifying key |
-| `bootstrap.bin` | the `Initialize` instruction payload, minus its tag byte |
-| `finalization_{0,1,2}.bin` | `SubmitFinalization` payloads, minus their tag bytes |
-| `fixtures.json` | the same values in hex, for scripts and humans |
+## Provenance
 
-The three finalizations cover epochs 300001 to 300003. The first reuses the
-bootstrap accumulator commitment; the other two change it, so both branches of
-`submit_finalization` are covered.
+Produced 2026-08-18 on a rented GPU box under Zisk **v1.0.0-alpha** — the newest
+release whose SNARK proving key exists. `prove` took 689 s and `wrap --plonk`
+436 s, both on CPU: `cargo-zisk` reported itself as the `[gpu]` build but the
+card sat at 0% utilisation throughout. The full artifact set, the guest source
+and the run log are in `workspace/zkasper-plonk-wrap-artifacts/`.
 
-Regenerate with `./scripts/fixtures.sh`. The RNG is seeded, so the output is
-byte-for-byte reproducible.
+| field | bytes | |
+| --- | --- | --- |
+| `programVK` | 32 | the stand-in guest |
+| `rootCVadcopFinal` | 32 | v1.0.0-alpha's vadcop_final verkey |
+| `publicValues` | 256 | the 176 real bytes, zero-padded into Zisk's 64-slot window |
+| `proofBytes` | 768 | `uint256[24]` |
 
-## Replacing them
+The single public input those hash to is
+`0x06986ad52e060708cc549df54fb38fa3c9391b8eb913176a44cdad3c32854f05`, and
+`the_public_input_matches_the_wrap` checks the program derives exactly that.
 
-The program reads its verifying key from the light-client account, so swapping
-in real proofs is a data change, not a code change. See "Going live" in the
-top-level README.
+## Replacing it
+
+A real proof drops in as the same four fields — no code change, as long as the
+Zisk release matches `program/src/plonk/vk.rs` and the guest matches whatever
+`programVK` the light client was bootstrapped with. See "Going live" in the
+top-level README for what is still blocking upstream.
