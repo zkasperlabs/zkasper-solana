@@ -27,9 +27,10 @@ replaced by the matching syscall.
 ## Two transactions
 
 A PLONK proof is 768 bytes. The finalization output it attests to is another 176,
-and a message naming the payer, the state, the record, the anchor, the buffer and
-two programs is 342 more. That is **1,288 bytes against Solana's 1,232-byte
-packet limit**, so a submission cannot be one transaction:
+and the envelope around them — a signature, a blockhash, and seven account keys:
+payer, state, record, anchor, system program, this program and `ComputeBudget` —
+is 342 more. That is **1,288 bytes against Solana's 1,232-byte packet limit**, so
+a submission cannot be one transaction:
 
 | | bytes | |
 | --- | --- | --- |
