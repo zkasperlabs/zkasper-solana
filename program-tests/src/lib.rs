@@ -4,6 +4,7 @@
 //! Zisk v1.0.0-alpha. See `fixtures/README.md` for what it is a proof *of*.
 
 use zkasper_solana_program::plonk::vk::{PUBLIC_VALUES_LEN, ROOT_C_VADCOP_FINAL};
+use zkasper_solana_program::plonk::{compress_proof, COMPRESSED_PROOF_LEN};
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
 pub struct Fixture {
@@ -13,6 +14,8 @@ pub struct Fixture {
     /// Zisk's fixed public window, as the wrap hashed it.
     pub public_values: [u8; PUBLIC_VALUES_LEN],
     pub proof: Vec<u8>,
+    /// The same proof as a submission carries it: nine halved commitments.
+    pub compressed: [u8; COMPRESSED_PROOF_LEN],
     /// The window's leading bytes, read as the output they encode.
     pub output: FinalizationOutput,
 }
@@ -41,19 +44,16 @@ pub fn fixture() -> Fixture {
         .iter()
         .all(|b| *b == 0));
 
+    let proof = field("proofBytes");
     Fixture {
         program_vk: field("programVK").try_into().expect("32 bytes"),
         public_values,
-        proof: field("proofBytes"),
+        compressed: compress_proof(&proof).expect("768 bytes of proof"),
+        proof,
         output: FinalizationOutput::from_public_bytes(
             public_values[..FINALIZATION_PUBLIC_BYTES]
                 .try_into()
                 .unwrap(),
         ),
     }
-}
-
-/// The proof, as [`zkasper_solana_program::instruction::stage_proof`] wants it.
-pub fn proof_array(f: &Fixture) -> [u8; zkasper_solana_program::plonk::PROOF_LEN] {
-    f.proof.as_slice().try_into().expect("768 bytes")
 }

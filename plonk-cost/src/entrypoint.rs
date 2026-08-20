@@ -7,6 +7,7 @@
 
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, Field, PrimeField};
+use solana_bn254::compression::prelude::{alt_bn128_g1_compress_be, alt_bn128_g1_decompress_be};
 use solana_bn254::prelude::{
     alt_bn128_g1_addition_be, alt_bn128_g1_multiplication_be, alt_bn128_pairing_be,
 };
@@ -105,6 +106,17 @@ pub fn process_instruction(
         8 => proof.well_formed(),
         // The public input: one SHA-256 over 320 bytes and a reduction.
         9 => public_input(program_vk, &public_values) != Fr::from(0u64),
+        // `count` G1 decompressions, the syscall a compressed submission runs
+        // nine of. The one compression that sets it up is a constant the
+        // marginal cancels.
+        11 => {
+            let word = alt_bn128_g1_compress_be(&proof.a).expect("compress");
+            let mut acc = 0u8;
+            for _ in 0..count {
+                acc ^= alt_bn128_g1_decompress_be(&word).expect("decompress")[0];
+            }
+            acc != 0xff
+        }
         _ => return Err(ProgramError::InvalidInstructionData),
     };
 

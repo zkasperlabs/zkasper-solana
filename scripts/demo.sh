@@ -64,8 +64,7 @@ step "bootstrap (trusted, unproved)"
 cli init "$WRAP"
 cli show
 
-step "stage the wrapped proof, then submit it"
-cli stage "$WRAP"
+step "submit the wrapped proof"
 cli submit "$WRAP"
 cli show
 
@@ -87,8 +86,5 @@ if cli assert-anchored 0x0000000000000000000000000000000000000000000000000000000
   echo "UNEXPECTED: unanchored state root was accepted" >&2
   exit 1
 fi
-
-step "reclaim the staging rent"
-cli close-buffer
 
 printf '\n=== demo complete\n'

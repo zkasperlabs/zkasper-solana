@@ -6,9 +6,9 @@
 //! of that proof with Solana's BN254 syscalls, and advances the state.
 //!
 //! A wrapped proof is 768 bytes, which does not fit a Solana packet beside the
-//! output it attests to, so a submission is two transactions: `StageProof` parks
-//! the proof in a buffer the submitter owns, and `SubmitFinalization` verifies
-//! it from there.
+//! output it attests to. Compressing the nine G1 commitments halves each of them
+//! and brings the submission to 480 bytes of proof, so `SubmitFinalization`
+//! carries it inline and a submission is one transaction.
 //!
 //! See the README for the trust model, and in particular for the `epoch-diff`
 //! successor gap that makes the anchor records in [`state::AnchorRecord`] load
