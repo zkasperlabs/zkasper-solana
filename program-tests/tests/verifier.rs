@@ -27,7 +27,7 @@ use zkasper_solana_program::state::{
 };
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// A whole submission measures 476,587 units; this leaves headroom without
+/// A whole submission measures 477,279 units; this leaves headroom without
 /// overpaying for a limit the runtime reserves block space against.
 const COMPUTE_UNIT_LIMIT: u32 = 700_000;
 
@@ -698,7 +698,7 @@ fn measures_compute_units() {
     assert!(read < 10_000, "read path cost regressed: {read}");
     // Indexing does not care how full the ring is.
     assert_eq!(indexed, read, "the by-epoch lookup is no longer O(1)");
-    // A linear pass over 128 entries has to stay small against the 476,587 a
+    // A linear pass over 128 entries has to stay small against the 477,279 a
     // submission costs, or the reverse index was not worth removing. The
     // comparison stops at the first 8-byte word that differs, and 128 beacon
     // state roots that agree past one would be a SHA-256 collision, so this is

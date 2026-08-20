@@ -58,7 +58,7 @@ cli() { cargo run --quiet --release -p zkasper-cli -- "$RPC_URL" "$KEYPAIR" "$@"
 step "addresses"
 cli address
 
-WRAP=fixtures/wrap-469426.json
+WRAP=fixtures/wrap-469891.json
 
 step "bootstrap (trusted, unproved)"
 cli init "$WRAP"
@@ -71,7 +71,9 @@ cli show
 step "read path"
 read -r EPOCH ROOT STATE_ROOT <<<"$(python3 -c "
 import json
-p = bytes.fromhex(json.load(open('$WRAP'))['publicValues'][2:])
+w = bytes.fromhex(json.load(open('$WRAP'))['publicValues'][2:])
+# Four bytes to a slot: the window renders each public at u64 width.
+p = b''.join(w[i * 8:i * 8 + 4] for i in range(len(w) // 8))
 print(int.from_bytes(p[64:72], 'little'), '0x' + p[72:104].hex(), '0x' + p[104:136].hex())
 ")"
 

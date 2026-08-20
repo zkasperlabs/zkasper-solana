@@ -29,9 +29,9 @@ fn the_real_wrapped_proof_verifies() {
     );
 }
 
-/// The public input is the one `cargo-zisk wrap --plonk` reported, so the
-/// preimage this program builds — pinned guest key, re-expanded window, pinned
-/// `rootCVadcopFinal` — is the preimage Zisk hashed.
+/// The public input is the one the wrap committed, so the preimage this program
+/// builds — pinned guest key, re-expanded window, pinned `rootCVadcopFinal` — is
+/// the preimage Zisk hashed.
 #[test]
 fn the_public_input_matches_the_wrap() {
     use ark_ff::{BigInteger, PrimeField};
@@ -42,7 +42,7 @@ fn the_public_input_matches_the_wrap() {
                 .into_bigint()
                 .to_bytes_be()
         ),
-        "06986ad52e060708cc549df54fb38fa3c9391b8eb913176a44cdad3c32854f05",
+        "1ff2741cc9d9d642ef0507c1939c7c1da13dca625d7d00ceda84343b9dcc7476",
     );
 }
 
@@ -69,14 +69,20 @@ fn the_compressed_proof_verifies() {
     assert!(plonk::verify(&proof, &f.program_vk, &f.public_values).is_ok());
 }
 
-/// The compressed encoding is canonical, so no two submissions decompress to the
-/// same proof and a valid proof has exactly one encoding.
+/// The compressed encoding is canonical everywhere but at infinity, and that
+/// exception costs nothing.
 ///
-/// The one point with a short-circuit is infinity, which is all zeros on both
-/// sides. Arkworks' alternative spelling of it -- the infinity flag set over a
-/// real x -- is rejected rather than folded onto the same 64 bytes.
+/// The top two bits of the leading byte are flags — `0x80` picks the other
+/// square root, `0x40` says the point is infinity — and the x below them is
+/// always canonical, since the modulus is under `2^254`. Setting `0x40` over a
+/// real x is accepted and decompresses to the 64 zero bytes, discarding the x:
+/// infinity is *folded* onto one encoding rather than rejected, so a submission
+/// carrying it has many spellings and every one of them fails the pairing. The
+/// tree said "rejected" until a proof whose first commitment had `0x80` clear
+/// showed the difference; with `0x80` set the pair `0xc0` is not a spelling of
+/// anything, which is what was really being observed.
 #[test]
-fn the_compressed_encoding_is_canonical() {
+fn the_compressed_encoding_is_canonical_except_at_infinity() {
     let f = fixture();
     let compressed = plonk::compress_proof(&f.proof).unwrap();
 
@@ -86,12 +92,43 @@ fn the_compressed_encoding_is_canonical() {
         .iter()
         .all(|b| *b == 0));
 
-    for flags in [0x40, 0xc0] {
-        let mut spelled = compressed;
-        spelled[0] |= flags;
+    for (word, name) in COMMITMENTS {
+        let at = word / 2 * 32;
+        // Drop both flags to reach the x alone, whatever this proof spelled it as.
+        let mut plain = compressed;
+        plain[at] &= 0x3f;
+
+        let mut point_at_infinity = plain;
+        point_at_infinity[at] |= 0x40;
+        let out = plonk::decompress_proof(&point_at_infinity)
+            .unwrap_or_else(|_| panic!("{name}: the infinity spelling was rejected"));
         assert!(
-            plonk::decompress_proof(&spelled).is_err(),
-            "a second encoding of a point was accepted with flags {flags:#x}",
+            out[word * 32..word * 32 + 64].iter().all(|b| *b == 0),
+            "{name}: the infinity flag did not discard the x below it",
+        );
+
+        let mut both = plain;
+        both[at] |= 0xc0;
+        assert!(
+            plonk::decompress_proof(&both).is_err(),
+            "{name}: both flags at once was accepted",
+        );
+
+        // And the sign bit names the other root, not the same point twice.
+        let mut negated = plain;
+        negated[at] |= 0x80;
+        let positive = plonk::decompress_proof(&plain)
+            .unwrap_or_else(|_| panic!("{name}: the positive root was rejected"));
+        let negated = plonk::decompress_proof(&negated)
+            .unwrap_or_else(|_| panic!("{name}: the negated root was rejected"));
+        assert_eq!(
+            positive[word * 32..word * 32 + 32],
+            negated[word * 32..word * 32 + 32]
+        );
+        assert_ne!(
+            positive[word * 32 + 32..word * 32 + 64],
+            negated[word * 32 + 32..word * 32 + 64],
+            "{name}: the sign bit changed nothing",
         );
     }
 }
@@ -123,6 +160,22 @@ fn a_byte_in_the_padding_is_rejected() {
     let mut publics = f.public_values;
     *publics.last_mut().unwrap() = 1;
     assert!(plonk::verify(&f.proof, &f.program_vk, &publics).is_err());
+}
+
+/// Nor is the half of each slot the guest cannot reach. Every public is four
+/// bytes read at eight, so half the window is interleaved zeros — and they are
+/// hashed like everything else rather than skipped.
+#[test]
+fn a_byte_in_a_slot_the_guest_did_not_write_is_rejected() {
+    let f = fixture();
+    for slot in [0, 43, 51] {
+        let mut publics = f.public_values;
+        publics[slot * 8 + 4] = 1;
+        assert!(
+            plonk::verify(&f.proof, &f.program_vk, &publics).is_err(),
+            "the high half of slot {slot} was accepted",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

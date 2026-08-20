@@ -42,10 +42,12 @@ pub const FINALIZATION_PUBLIC_BYTES: usize = 32 + 32 + 8 + 32 + 32 + 8 + 32;
 /// proof whose guest committed any other key produces a different digest and
 /// fails. The submitter never gets to name it, which is the whole point.
 ///
-/// It is `false` here because the only wrapped proof that exists predates that
-/// commit — see `fixtures/README.md`. Flipping it is a one-line change with a
-/// test either side; nothing else in the program moves.
-pub const GUEST_COMMITS_PROGRAM_VK: bool = false;
+/// It is `true` since `fixtures/wrap-469891.json`, whose guest is a production
+/// zkasperd from after that commit: slots 44..52 of its public window hold the
+/// key its own proof was produced under. A proof from a guest that predates the
+/// field no longer verifies here, which is the same statement as the release
+/// pin in [`crate::plonk::vk`] and is deliberate — both ends moved at once.
+pub const GUEST_COMMITS_PROGRAM_VK: bool = true;
 
 /// A zkasper accumulator digest: 4 Goldilocks elements, each little-endian.
 ///
@@ -53,7 +55,13 @@ pub const GUEST_COMMITS_PROGRAM_VK: bool = false;
 /// in both directions, and the program never does field arithmetic on it.
 pub type AccumulatorCommitment = [u8; 32];
 
-/// The Zisk program verification key of the finalization guest, 4 u64s LE.
+/// The Zisk program verification key of the finalization guest.
+///
+/// Four u64s **big-endian**: the `programVK` of a Zisk Solidity fixture, and the
+/// bytes [`crate::plonk::public_input`] hashes. The guest writes the same four
+/// words little-endian into its own output, so the two encodings of one key both
+/// appear in the preimage, eight bytes apart — `guest_program_vk` below is the
+/// reversal between them.
 pub type ProgramVk = [u8; 32];
 
 /// Public outputs of a zkasper streaming finalization proof.
@@ -116,20 +124,44 @@ impl FinalizationOutput {
     }
 }
 
+/// The pinned key in the encoding the guest wrote it in.
+///
+/// [`ProgramVk`] is big-endian because that is how the SNARK preimage opens; the
+/// trailing field of the committed output is the same key as zkasper's
+/// `PublicWriter` laid it down, four little-endian u64s. Reversing eight bytes
+/// at a time is the whole of the difference, and doing it here means the program
+/// stores one encoding rather than two fields that must agree.
+fn guest_program_vk(program_vk: &ProgramVk) -> ProgramVk {
+    let mut out = *program_vk;
+    for word in out.chunks_exact_mut(8) {
+        word.reverse();
+    }
+    out
+}
+
 /// The guest's committed output, re-expanded into Zisk's fixed public window.
 ///
 /// Zisk hashes a window of constant width whatever the guest wrote, so the
-/// program can carry the fields alone — 176 bytes on the wire instead of 256 —
-/// and rebuild the padding here.
+/// program can carry the fields alone — 176 bytes on the wire instead of 512 —
+/// and rebuild the rest here.
+///
+/// The window is 64 slots holding four bytes of guest output each, and the
+/// preimage renders every slot as a little-endian u64: four bytes on, four
+/// bytes off. Those interleaved zeros are not padding the guest could have
+/// written into — they are the high half of a u32 read at u64 width — but they
+/// are covered by the digest exactly as the trailing zeros are.
 pub fn public_values(
     output: &FinalizationOutput,
     program_vk: &ProgramVk,
 ) -> [u8; PUBLIC_VALUES_LEN] {
-    let mut window = [0u8; PUBLIC_VALUES_LEN];
-    window[..FINALIZATION_PUBLIC_BYTES].copy_from_slice(&output.public_bytes());
+    let mut committed = [0u8; FINALIZATION_PUBLIC_BYTES + 32];
+    committed[..FINALIZATION_PUBLIC_BYTES].copy_from_slice(&output.public_bytes());
     if GUEST_COMMITS_PROGRAM_VK {
-        window[FINALIZATION_PUBLIC_BYTES..FINALIZATION_PUBLIC_BYTES + 32]
-            .copy_from_slice(program_vk);
+        committed[FINALIZATION_PUBLIC_BYTES..].copy_from_slice(&guest_program_vk(program_vk));
+    }
+    let mut window = [0u8; PUBLIC_VALUES_LEN];
+    for (slot, four) in window.chunks_exact_mut(8).zip(committed.chunks_exact(4)) {
+        slot[..4].copy_from_slice(four);
     }
     window
 }
@@ -188,22 +220,44 @@ mod tests {
         assert_eq!(output.public_bytes().as_slice(), expected.as_slice());
     }
 
-    /// The window is the output, then the pinned key if the guest commits one,
-    /// then zeros — the shape both sides of [`GUEST_COMMITS_PROGRAM_VK`] take.
+    /// Every slot carries four bytes of guest output and four zeros, and the
+    /// four-byte halves in order are the output, then the pinned key if the
+    /// guest commits one, then nothing.
     #[test]
-    fn the_public_window_pads_the_output() {
-        let program_vk = [0x5au8; 32];
+    fn the_public_window_spreads_the_output() {
+        let program_vk: ProgramVk = std::array::from_fn(|i| i as u8);
         let window = public_values(&sample(), &program_vk);
+
+        let mut halves = Vec::new();
+        for slot in window.chunks_exact(8) {
+            halves.extend_from_slice(&slot[..4]);
+            assert!(
+                slot[4..].iter().all(|b| *b == 0),
+                "slot high half is not zero"
+            );
+        }
+
         assert_eq!(
-            window[..FINALIZATION_PUBLIC_BYTES],
+            halves[..FINALIZATION_PUBLIC_BYTES],
             sample().public_bytes()[..]
         );
-        let tail = &window[FINALIZATION_PUBLIC_BYTES..];
+        let tail = &halves[FINALIZATION_PUBLIC_BYTES..];
         if GUEST_COMMITS_PROGRAM_VK {
-            assert_eq!(tail[..32], program_vk);
+            assert_eq!(tail[..32], guest_program_vk(&program_vk));
             assert!(tail[32..].iter().all(|b| *b == 0));
         } else {
             assert!(tail.iter().all(|b| *b == 0));
         }
+    }
+
+    /// The two encodings of the key are byte reversals of one another, eight
+    /// bytes at a time, and neither is a reversal of the whole.
+    #[test]
+    fn the_guest_writes_the_pinned_key_the_other_way_round() {
+        let program_vk: ProgramVk = std::array::from_fn(|i| i as u8);
+        let guest = guest_program_vk(&program_vk);
+        assert_eq!(guest[..8], [7, 6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(guest[24..], [31, 30, 29, 28, 27, 26, 25, 24]);
+        assert_eq!(guest_program_vk(&guest), program_vk);
     }
 }

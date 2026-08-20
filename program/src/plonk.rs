@@ -236,7 +236,7 @@ impl<'a> Proof<'a> {
     /// rejects anything off the curve — `PodG1 -> G1` deserializes with
     /// `Validate::Yes` and then calls `is_on_curve` again. BN254's G1 has
     /// cofactor one, so on-curve is subgroup membership. Running the test in
-    /// software as well costs 104,679 units and buys one thing: it also rejects
+    /// software as well costs 104,667 units and buys one thing: it also rejects
     /// the encoded point at infinity, which the syscall accepts and which is a
     /// legitimate group element the KZG argument is sound over.
     ///

@@ -15,9 +15,9 @@ use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, keccak, program_error::ProgramError,
     pubkey::Pubkey,
 };
-use zkasper_solana_program::plonk::vk::{self, PUBLIC_VALUES_LEN};
+use zkasper_solana_program::plonk::vk;
 use zkasper_solana_program::plonk::{public_input, verify_with, Proof};
-use zkasper_solana_program::wire::FINALIZATION_PUBLIC_BYTES;
+use zkasper_solana_program::wire::{public_values, FinalizationOutput};
 
 use crate::{PAYLOAD_OFF_PROGRAM_VK, PAYLOAD_OFF_PROOF, PAYLOAD_OFF_PUBLICS};
 
@@ -34,10 +34,14 @@ pub fn process_instruction(
         .try_into()
         .unwrap();
     // The program carries the guest's output and rebuilds Zisk's fixed window on
-    // chain; so does this, so the measurement includes that work.
-    let mut public_values = [0u8; PUBLIC_VALUES_LEN];
-    public_values[..FINALIZATION_PUBLIC_BYTES]
-        .copy_from_slice(&data[PAYLOAD_OFF_PUBLICS..PAYLOAD_OFF_PROOF]);
+    // chain; so does this, through the same function, so the measurement
+    // includes that work and cannot drift from it.
+    let output = FinalizationOutput::from_public_bytes(
+        data[PAYLOAD_OFF_PUBLICS..PAYLOAD_OFF_PROOF]
+            .try_into()
+            .unwrap(),
+    );
+    let public_values = public_values(&output, program_vk);
     let proof_bytes = &data[PAYLOAD_OFF_PROOF..];
 
     // Parsing is charged to the baseline, so no mode pays for it alone.
