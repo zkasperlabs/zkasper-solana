@@ -622,6 +622,16 @@ fn what_a_submission_weighs() {
         Some(COMPUTE_UNIT_LIMIT),
     );
 
+    // Both sizes are of transactions that already carry the budget raise: the
+    // limit is not something a submitter adds afterwards and re-measures.
+    for tx in [&stage, &submit] {
+        assert_eq!(tx.message.instructions.len(), 2);
+        assert_eq!(
+            tx.message.account_keys[tx.message.instructions[0].program_id_index as usize],
+            solana_compute_budget_interface::id(),
+        );
+    }
+
     println!("\nserialized transaction bytes (packet limit {PACKET_LIMIT})");
     println!("  1. stage_proof          {:>5}", size(&stage));
     println!("  2. submit_finalization  {:>5}", size(&submit));
