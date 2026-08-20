@@ -82,10 +82,15 @@ prices each piece in its own transaction:
 | eighteen `alt_bn128` scalar multiplications | 116,334 (6,463 each) |
 | one pairing of two pairs | 49,088 |
 | eighteen point additions | 7,524 (418 each) |
-| ~92 `Fr` multiplications, in software | ~183,000 (1,990 each) |
 | one `Fr` inversion, in software | 50,682 |
 | the public input, one SHA-256 over 320 bytes | 10,612 |
 | the Fiat-Shamir transcript, six keccaks | 1,642 |
+| everything else: about a hundred `Fr` multiplications at 1,990 each, and the byte conversions between them | 231,379 |
+| **verification, net of the 13,020-unit baseline** | **467,261** |
+
+Note the scalar multiplications cost 6,463 rather than the 3,840 Solana's own
+table quotes, and the additions 418 rather than 334. Those are the measured
+marginal costs.
 
 The `Fr` arithmetic is the largest line and there is no syscall for it.
 `sol_big_mod_exp` would invert by Fermat for a fraction of the price its table
@@ -161,6 +166,35 @@ deployer's `initialize`.
 The read path works two ways. A program that wants a hard failure CPIs
 `AssertFinalized`; a program that wants a value derives the record PDA and reads
 the account directly, with no CPI at all.
+
+### What the verifier deliberately skips
+
+snarkjs's Solidity verifier opens with `checkProofData`: nine tests that each G1
+commitment satisfies `y^2 = x^3 + 3`, with both coordinates below the base field
+modulus. This program does not run it, and that is worth 104,679 units — a fifth
+of the whole submission.
+
+The reason is that every one of the nine commitments is an operand to an
+`alt_bn128` syscall before it can reach the pairing, and the syscall already does
+the work: `PodG1 -> G1` deserializes each coordinate canonically, rejects
+anything that is not a field element, and calls `is_on_curve`. BN254's G1 has
+cofactor one, so on-curve *is* subgroup membership. Doing it again in software
+buys one thing — `checkProofData` also rejects the encoded point at infinity,
+which the syscalls accept, and which is a legitimate group element the KZG
+argument is sound over. The pairing rejects it anyway, because the transcript
+hashes the commitment bytes.
+
+`a_corrupted_commitment_is_rejected_without_the_membership_check` in
+[`program-tests/tests/plonk.rs`](program-tests/tests/plonk.rs) is the evidence:
+each of the nine slots, corrupted three ways — off the curve, non-canonical, and
+the point at infinity — and rejected every time with the check off. The check
+itself is kept as `Proof::well_formed`, unused by the verification path, so its
+cost can be quoted and the two paths compared.
+
+What is *not* skipped is the range check on the six opening evaluations. That one
+is not redundant: the transcript hashes the wire bytes, so a non-canonical
+evaluation would hash differently from the value the algebra uses. It happens in
+`Proof::parse` and is nearly free.
 
 ## The proof interface
 
