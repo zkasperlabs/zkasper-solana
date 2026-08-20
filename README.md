@@ -75,6 +75,12 @@ the compiled SBPF v3 program running the real wrapped proof; reproduce with
 `./scripts/test.sh`, and see `measures_compute_units` in
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs).
 
+The same submission on a real `solana-test-validator` — `./scripts/demo.sh` —
+consumed **488,465**. The gap is bump seeds: `find_program_address` walks
+downwards from 255 at 1,500 units an attempt, and a different authority lands on
+different bumps for its three PDAs. Budget for the variance rather than the
+measurement.
+
 Where it goes, from `cargo test -p zkasper-plonk-cost -- --nocapture`, which
 prices each piece in its own transaction:
 
