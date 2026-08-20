@@ -14,6 +14,7 @@ pub mod vk;
 
 use ark_bn254::{Fq, Fr};
 use ark_ff::{BigInt, BigInteger, Field, PrimeField, Zero};
+use solana_bn254::compression::prelude::{alt_bn128_g1_compress_be, alt_bn128_g1_decompress_be};
 use solana_bn254::prelude::{
     alt_bn128_g1_addition_be, alt_bn128_g1_multiplication_be, alt_bn128_pairing_be,
 };
@@ -25,6 +26,13 @@ use vk::G1;
 
 /// `uint256[24]`: nine G1 commitments then six opening evaluations.
 pub const PROOF_LEN: usize = 768;
+
+/// The same proof with every commitment halved: nine 32-byte compressed G1
+/// points, then the six evaluations unchanged.
+///
+/// This is what a submission carries. 768 bytes does not fit a packet beside
+/// the output it attests to; 480 does.
+pub const COMPRESSED_PROOF_LEN: usize = 9 * 32 + 6 * 32;
 
 type R<T> = Result<T, ZkasperError>;
 
@@ -132,6 +140,47 @@ pub struct Proof<'a> {
     /// the field elements, and 768 bytes of proof plus 576 of points does not
     /// fit an SBF stack frame.
     raw: &'a [u8],
+}
+
+/// Expand a compressed proof into the 768 bytes [`Proof::parse`] reads.
+///
+/// The transcript hashes the wire bytes, so this has to reproduce the encoding
+/// an uncompressed submission would have carried and not merely an equal group
+/// element: `alt_bn128_g1_decompress_be` returns `x || y` big-endian, which is
+/// the `uint256[2]` snarkjs writes, and the six evaluations are copied through
+/// untouched. Everything downstream then runs on bytes it cannot distinguish
+/// from the artifact's own.
+///
+/// Decompression is also a stronger parse than the syscalls were doing: the
+/// x-coordinate is rejected unless it is canonical and `x^3 + 3` is a square,
+/// so the nine points are on the curve by construction -- and on BN254's G1,
+/// with cofactor one, that is subgroup membership.
+pub fn decompress_proof(compressed: &[u8]) -> R<[u8; PROOF_LEN]> {
+    let compressed: &[u8; COMPRESSED_PROOF_LEN] = compressed.try_into().map_err(|_| FAILED)?;
+    let mut proof = [0u8; PROOF_LEN];
+    for (i, word) in compressed[..9 * 32].chunks_exact(32).enumerate() {
+        // The syscall wants a fixed-size array; off chain the same function
+        // takes a slice, so the annotation is what keeps both targets happy.
+        let word: &[u8; 32] = word.try_into().unwrap();
+        let point = alt_bn128_g1_decompress_be(word).map_err(|_| FAILED)?;
+        proof[i * 64..i * 64 + 64].copy_from_slice(&point);
+    }
+    proof[9 * 64..].copy_from_slice(&compressed[9 * 32..]);
+    Ok(proof)
+}
+
+/// The inverse, for a client holding the 768-byte artifact `cargo-zisk wrap`
+/// emits. Never called on chain.
+pub fn compress_proof(proof: &[u8]) -> R<[u8; COMPRESSED_PROOF_LEN]> {
+    let proof: &[u8; PROOF_LEN] = proof.try_into().map_err(|_| FAILED)?;
+    let mut compressed = [0u8; COMPRESSED_PROOF_LEN];
+    for (i, point) in proof[..9 * 64].chunks_exact(64).enumerate() {
+        let point: &[u8; 64] = point.try_into().unwrap();
+        let word = alt_bn128_g1_compress_be(point).map_err(|_| FAILED)?;
+        compressed[i * 32..i * 32 + 32].copy_from_slice(&word);
+    }
+    compressed[9 * 32..].copy_from_slice(&proof[9 * 64..]);
+    Ok(compressed)
 }
 
 impl<'a> Proof<'a> {

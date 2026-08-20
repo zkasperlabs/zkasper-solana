@@ -7024,7 +7024,6 @@ dependencies = [
  "bincode",
  "hex",
  "litesvm",
- "solana-address-lookup-table-interface",
  "solana-builtins",
  "solana-compute-budget-interface",
  "solana-instruction",

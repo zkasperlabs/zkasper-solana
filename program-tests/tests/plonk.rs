@@ -5,7 +5,7 @@
 //! holds on chain. What they cannot establish is cost; that is `verifier.rs`.
 
 use zkasper_program_tests::fixture;
-use zkasper_solana_program::plonk::{self, Proof, PROOF_LEN};
+use zkasper_solana_program::plonk::{self, Proof, COMPRESSED_PROOF_LEN, PROOF_LEN};
 
 /// Word offsets of the nine G1 commitments in the 24-word proof.
 const COMMITMENTS: [(usize, &str); 9] = [
@@ -44,6 +44,56 @@ fn the_public_input_matches_the_wrap() {
         ),
         "06986ad52e060708cc549df54fb38fa3c9391b8eb913176a44cdad3c32854f05",
     );
+}
+
+/// Compression is a re-encoding and not a re-derivation, which is the whole
+/// soundness question: the transcript hashes the wire bytes, so the 768 bytes
+/// the verifier sees have to be the artifact's own, byte for byte.
+#[test]
+fn decompression_reproduces_the_proof_byte_for_byte() {
+    let f = fixture();
+    let compressed = plonk::compress_proof(&f.proof).expect("compress");
+    assert_eq!(compressed.len(), COMPRESSED_PROOF_LEN);
+    assert_eq!(
+        plonk::decompress_proof(&compressed).expect("decompress")[..],
+        f.proof[..],
+    );
+}
+
+/// And so a compressed submission verifies through exactly the code an
+/// uncompressed one ran.
+#[test]
+fn the_compressed_proof_verifies() {
+    let f = fixture();
+    let proof = plonk::decompress_proof(&plonk::compress_proof(&f.proof).unwrap()).unwrap();
+    assert!(plonk::verify(&proof, &f.program_vk, &f.public_values).is_ok());
+}
+
+/// The compressed encoding is canonical, so no two submissions decompress to the
+/// same proof and a valid proof has exactly one encoding.
+///
+/// The one point with a short-circuit is infinity, which is all zeros on both
+/// sides. Arkworks' alternative spelling of it -- the infinity flag set over a
+/// real x -- is rejected rather than folded onto the same 64 bytes.
+#[test]
+fn the_compressed_encoding_is_canonical() {
+    let f = fixture();
+    let compressed = plonk::compress_proof(&f.proof).unwrap();
+
+    let mut infinity = compressed;
+    infinity[..32].fill(0);
+    assert!(plonk::decompress_proof(&infinity).unwrap()[..64]
+        .iter()
+        .all(|b| *b == 0));
+
+    for flags in [0x40, 0xc0] {
+        let mut spelled = compressed;
+        spelled[0] |= flags;
+        assert!(
+            plonk::decompress_proof(&spelled).is_err(),
+            "a second encoding of a point was accepted with flags {flags:#x}",
+        );
+    }
 }
 
 /// A proof of a different guest is a proof of a different program, and this is

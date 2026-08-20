@@ -35,6 +35,7 @@ const TRANSCRIPT: u8 = 7;
 const WELL_FORMED: u8 = 8;
 const PUBLIC_INPUT: u8 = 9;
 const VERIFY_WITH_MEMBERSHIP: u8 = 10;
+const G1_DECOMPRESS: u8 = 11;
 
 struct Harness {
     svm: LiteSVM,
@@ -122,11 +123,14 @@ fn what_a_plonk_wrap_costs_to_verify() {
     let transcript = h.run(TRANSCRIPT, 0);
     let well_formed = h.run(WELL_FORMED, 0);
     let public_input = h.run(PUBLIC_INPUT, 0);
+    let decompress_1 = h.run(G1_DECOMPRESS, 1);
+    let decompress_11 = h.run(G1_DECOMPRESS, 11);
 
     let per_mul = (mul_11 - mul_1) / 10;
     let per_add = (add_11 - add_1) / 10;
     let per_fr_mul = (fr_mul_110 - fr_mul_10) / 100;
     let per_fr_inv = (fr_inv_11 - fr_inv_1) / 10;
+    let per_decompress = (decompress_11 - decompress_1) / 10;
 
     println!("\ncompute units, whole transaction");
     println!("  baseline (parse only)      {baseline:>9}");
@@ -146,6 +150,8 @@ fn what_a_plonk_wrap_costs_to_verify() {
     println!("  alt_bn128 G1 add           {per_add:>9}   (table:  334)");
     println!("  Fr mul, software           {per_fr_mul:>9}");
     println!("  Fr inversion, software     {per_fr_inv:>9}");
+    println!("  alt_bn128 G1 decompress    {per_decompress:>9}   (table:  398 + 100 base)");
+    println!("  nine of them, a submission {:>9}", per_decompress * 9);
 
     const SYSCALL_FLOOR: u64 = 18 * 3_840 + 18 * 334 + 36_364 + 2 * 12_121;
     println!("\n  BN254 syscall floor        {SYSCALL_FLOOR:>9}");
@@ -161,6 +167,11 @@ fn what_a_plonk_wrap_costs_to_verify() {
     assert!(
         verify < 1_400_000,
         "a PLONK verification does not fit one transaction: {verify}"
+    );
+    assert!(
+        per_decompress < 1_000,
+        "G1 decompression regressed; it is what makes a submission one transaction \
+         rather than two: {per_decompress}"
     );
     assert!(
         verify_guarded > verify,

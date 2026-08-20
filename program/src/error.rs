@@ -29,8 +29,6 @@ pub enum ZkasperError {
     /// a branch. Rejecting is what keeps the chain unbroken without the program
     /// ever seeing an epoch-diff proof.
     AccumulatorMismatch = 15,
-    /// The staging account is not this submitter's proof buffer.
-    InvalidProofBuffer = 16,
     /// The accumulator matched, but it is not the accumulator of the epoch this
     /// finalization claims to start from — the submission skips an epoch.
     ///

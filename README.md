@@ -24,50 +24,63 @@ replaced by the matching syscall.
 > finalization guest — see `fixtures/README.md`. Binding a deployment to the real
 > guest is one 32-byte value at bootstrap and nothing else.
 
-## Two transactions
+## One transaction
 
 A PLONK proof is 768 bytes. The finalization output it attests to is another 176,
-and the envelope around them — a signature, a blockhash, and seven account keys:
+and the envelope around them — a signature, a blockhash, and six account keys:
 payer, state, record, anchor, system program, this program and `ComputeBudget` —
-is 342 more. That is **1,288 bytes against Solana's 1,232-byte packet limit**, so
-a submission cannot be one transaction:
+is the rest. Sent whole, that is **1,288 bytes against Solana's 1,232-byte packet
+limit**, and a submission does not fit.
+
+Nine of the proof's twenty-four words are not scalars but the `x` halves of nine
+G1 commitments, and a BN254 point is determined by `x` and one sign bit. So the
+proof travels compressed at 32 bytes a commitment instead of 64, and the program
+expands it with `alt_bn128_g1_decompress` — a syscall live on mainnet since slot
+276,912,000 — before anything reads it:
 
 | | bytes | |
 | --- | --- | --- |
-| one legacy transaction, proof inline | 1,288 | over |
-| v0 transaction, lookup table holds the fixed accounts | 1,262 | over |
-| v0 transaction, lookup table *also* holds the record and anchor | 1,200 | fits |
-| **1. `stage_proof`** | **1,046** | fits |
-| **2. `submit_finalization`** | **553** | fits |
+| one transaction, proof sent whole | 1,288 | over |
+| **one transaction, nine commitments compressed** | **1,000** | **fits, 232 spare** |
 
 Measured, not modelled — `what_a_submission_weighs` in
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs) serializes
-each of them.
+both.
 
-The lookup-table row that fits is not a one-transaction design either. The
-finalization record and the anchor record are new addresses every epoch, and a
-lookup table's entries cannot be used until the slot *after* they are added, so
-that route needs an `extend_lookup_table` transaction ahead of every submission —
-two transactions, a table to maintain, 256 addresses of capacity, and rent on the
-table. Staging costs the same two transactions and none of the rest.
+The instruction data is 657 bytes: one tag, 480 of compressed proof, 176 of
+output. Nothing is staged, so there is no buffer account, no second signature and
+no second fee.
 
-So `stage_proof` writes the proof into a buffer PDA the submitter owns, and
-`submit_finalization` verifies it from there. The buffer is reusable and its rent
-is refundable with `close_proof_buffer`.
+Decompression must be exact, not merely correct, because the Fiat-Shamir
+transcript hashes the proof's *wire bytes*. `alt_bn128_g1_decompress` returns the
+same big-endian `x || y` pair snarkjs writes, so the 768 bytes the verifier hashes
+are the artifact's own, byte for byte —
+`decompression_reproduces_the_proof_byte_for_byte` in
+[`program-tests/tests/plonk.rs`](program-tests/tests/plonk.rs) is that assertion.
+It also tightens the parse: a compressed `x` is rejected unless it is canonical
+and `x^3 + 3` is a square, so the nine commitments are on the curve by
+construction, and BN254's G1 has cofactor one, so on-curve is subgroup
+membership.
 
 ## Measured cost
 
-A submission costs **481,005 compute units**, which does **not** fit Solana's
+A submission costs **484,908 compute units**, which does **not** fit Solana's
 200,000-unit default: every submitter must raise the limit with
 `ComputeBudgetProgram`. 700,000 is the value the CLI asks for.
 
 | Path | Compute units |
 | --- | --- |
-| `submit_finalization` — verify, advance state, write two records | **481,005** |
-| `verify_only` — PLONK verification alone | 467,021 |
-| `stage_proof` — write 768 bytes, no cryptography | 4,893 |
-| `assert_finalized` / `assert_anchored` — read path | 3,731 |
-| `initialize` — trusted bootstrap | 6,873 |
+| `submit_finalization` — decompress, verify, advance state, write two records | **484,908** |
+| `verify_only` — decompression and PLONK verification alone | 472,531 |
+| `assert_finalized` / `assert_anchored` — read path | 3,728 |
+| `initialize` — trusted bootstrap | 6,874 |
+
+Nine G1 decompressions are 4,878 of that, measured marginally — 542 each, of
+which 498 is the syscall (a 100-unit base plus the 398 the table quotes) and the
+rest is the caller moving 96 bytes. They are not the whole difference from the
+two-transaction design's 481,005: dropping the buffer also drops an account load
+and a `find_program_address` walk, so the net cost of going compressed and
+single-transaction is 3,903 units.
 
 Whole-transaction figures, each including 150 units for the `ComputeBudget`
 instruction itself. Measured under LiteSVM with mainnet's feature set, against
@@ -76,10 +89,10 @@ the compiled SBPF v3 program running the real wrapped proof; reproduce with
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs).
 
 The same submission on a real `solana-test-validator` — `./scripts/demo.sh`,
-which generates a fresh payer each run — consumed **485,504**. The gap is bump
+which generates a fresh payer each run — costs a little more. The gap is bump
 seeds: `find_program_address` walks downwards from 255 at 1,500 units an attempt,
-and a different authority lands on different bumps for its four PDAs. Budget for
-the variance rather than for the measurement.
+and a different authority lands on different bumps for its PDAs. Budget for the
+variance rather than for the measurement.
 
 Where it goes, from `cargo test -p zkasper-plonk-cost -- --nocapture`, which
 prices each piece in its own transaction:
@@ -106,25 +119,21 @@ comes back "unsupported BPF instruction" even with mainnet's feature set active.
 
 ### What a submission costs in SOL
 
-Compute units are not the bill. A submission spends **2,877,520 lamports** net,
+Compute units are not the bill. A submission spends **2,872,520 lamports**,
 almost all of it rent-exempt balance left behind in the two accounts the program
 creates per finalization.
 
 | | lamports | at $77/SOL |
 | --- | --- | --- |
-| two transaction fees | 10,000 | $0.0008 |
+| one transaction fee | 5,000 | $0.0004 |
 | rent for the two records | 2,867,520 | $0.22 |
-| **total per finalization** | **2,877,520** | **$0.22** |
-| staging buffer, once, refundable | 6,250,080 | $0.48 |
+| **total per finalization** | **2,872,520** | **$0.22** |
 | `initialize`, once | 2,190,440 | $0.17 |
 | deploying the program | ~600,000,000 | ~$46 |
 
 Measured, from `measures_lamports` in the same test file. The record rent is not
 refundable, by design — the records *are* the read path, and a record that can be
-closed is a finality claim that can be withdrawn. The staging buffer is the
-opposite: it holds nothing anyone reads, so `close_proof_buffer` returns its rent
-whenever the submitter is done. Leaving it open costs nothing and saves the
-create on the next submission.
+closed is a finality claim that can be withdrawn.
 
 Priority fees are on top and were zero for these accounts at the time of
 measurement; nothing here contends for a hot account.
@@ -156,19 +165,16 @@ deployer's `initialize`.
 | `LightClientState` | `["zkasper-state", authority]` | 186 | accumulator commitment, latest state root, finalized epoch and root, and the guest program key |
 | `FinalizationRecord` | `["zkasper-fin", authority, epoch_le]` | 114 | one accepted finalization, never rewritten |
 | `AnchorRecord` | `["zkasper-anchor", authority, state_root]` | 42 | a beacon state root some accepted proof named |
-| proof buffer | `["zkasper-proof", submitter]` | 770 | one staged PLONK proof. Scoped to the submitter, so nobody can swap a proof out from under a pending submission |
 
 ### Instructions
 
 | Tag | Instruction | Effect |
 | --- | --- | --- |
 | 0 | `Initialize` | trusted bootstrap: write the starting checkpoint and bind the guest key |
-| 1 | `SubmitFinalization` | verify the staged proof, advance the state, write a finalization record and an anchor record. Permissionless |
+| 1 | `SubmitFinalization` | verify the compressed proof carried in the instruction, advance the state, write a finalization record and an anchor record. Permissionless |
 | 2 | `AssertFinalized` | fail unless `root` was finalized at `epoch`. For CPI |
 | 3 | `AssertAnchored` | fail unless some accepted proof named `state_root`. For CPI |
-| 4 | `VerifyOnly` | check a staged proof and change nothing. For `simulateTransaction` |
-| 5 | `StageProof` | write 768 bytes of proof into the submitter's buffer, creating it on first use. Permissionless |
-| 6 | `CloseProofBuffer` | return the buffer's rent to its owner |
+| 4 | `VerifyOnly` | check a proof and change nothing. For `simulateTransaction` |
 
 The read path works two ways. A program that wants a hard failure CPIs
 `AssertFinalized`; a program that wants a value derives the record PDA and reads
@@ -368,7 +374,7 @@ sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"   # if needed
 ```
 
 `scripts/demo.sh` starts `solana-test-validator`, deploys the verifier,
-bootstraps a light client, stages and submits the real wrapped proof, then
+bootstraps a light client, submits the real wrapped proof, then
 exercises the read path — including a negative case where an unanchored state
 root is correctly rejected.
 

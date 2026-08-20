@@ -8,62 +8,15 @@
 use solana_program::pubkey::Pubkey;
 
 use crate::error::ZkasperError;
-use crate::plonk::PROOF_LEN;
 use crate::wire::{AccumulatorCommitment, ProgramVk};
 
 pub const TAG_LIGHT_CLIENT: u8 = 1;
 pub const TAG_FINALIZATION_RECORD: u8 = 2;
 pub const TAG_ANCHOR_RECORD: u8 = 3;
-pub const TAG_PROOF_BUFFER: u8 = 4;
 
 pub const SEED_STATE: &[u8] = b"zkasper-state";
 pub const SEED_FINALIZATION: &[u8] = b"zkasper-fin";
 pub const SEED_ANCHOR: &[u8] = b"zkasper-anchor";
-
-// ---------------------------------------------------------------------------
-// Proof buffer
-// ---------------------------------------------------------------------------
-
-pub const SEED_PROOF: &[u8] = b"zkasper-proof";
-
-const BUF_OFF_TAG: usize = 0;
-const BUF_OFF_BUMP: usize = 1;
-/// Offset of the staged PLONK proof.
-pub const BUF_OFF_PROOF: usize = 2;
-
-pub const PROOF_BUFFER_LEN: usize = BUF_OFF_PROOF + PROOF_LEN;
-
-/// Scratch space one submitter uses to carry a proof between two transactions.
-///
-/// A PLONK proof is 768 bytes and a Solana packet is 1,232, so a submission
-/// that carries the proof, the finalization output and seven account keys does
-/// not fit — see `README.md`, "Two transactions". `StageProof` writes the proof
-/// here and `SubmitFinalization` reads it back.
-///
-/// The buffer is a PDA of the submitter, so only that submitter can write it and
-/// nobody can swap a proof out from under a pending submission. Its contents are
-/// never trusted: a proof either verifies against the pinned key and the claimed
-/// output or it does not.
-pub fn write_proof(data: &mut [u8], bump: u8, proof: &[u8; PROOF_LEN]) -> Result<(), ZkasperError> {
-    if data.len() < PROOF_BUFFER_LEN {
-        return Err(ZkasperError::AccountDataTooSmall);
-    }
-    data[BUF_OFF_TAG] = TAG_PROOF_BUFFER;
-    data[BUF_OFF_BUMP] = bump;
-    data[BUF_OFF_PROOF..BUF_OFF_PROOF + PROOF_LEN].copy_from_slice(proof);
-    Ok(())
-}
-
-/// The staged proof, read in place.
-pub fn staged_proof(data: &[u8]) -> Result<&[u8], ZkasperError> {
-    if data.len() < PROOF_BUFFER_LEN {
-        return Err(ZkasperError::AccountDataTooSmall);
-    }
-    if data[BUF_OFF_TAG] != TAG_PROOF_BUFFER {
-        return Err(ZkasperError::WrongAccountTag);
-    }
-    Ok(&data[BUF_OFF_PROOF..BUF_OFF_PROOF + PROOF_LEN])
-}
 
 // ---------------------------------------------------------------------------
 // LightClientState
@@ -335,9 +288,4 @@ pub fn anchor_record_address(
     state_root: &[u8; 32],
 ) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_ANCHOR, authority.as_ref(), state_root], program_id)
-}
-
-/// The staging buffer belonging to one submitter.
-pub fn proof_buffer_address(program_id: &Pubkey, payer: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[SEED_PROOF, payer.as_ref()], program_id)
 }

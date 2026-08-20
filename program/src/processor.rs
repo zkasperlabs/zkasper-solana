@@ -14,11 +14,10 @@ use solana_system_interface::program as system_program;
 
 use crate::error::ZkasperError;
 use crate::instruction::ZkasperInstruction;
-use crate::plonk::PROOF_LEN;
+use crate::plonk::COMPRESSED_PROOF_LEN;
 use crate::state::{
-    staged_proof, write_proof, AnchorRecord, FinalizationRecord, LightClientState,
-    ANCHOR_RECORD_LEN, FINALIZATION_RECORD_LEN, LIGHT_CLIENT_LEN, PROOF_BUFFER_LEN, SEED_ANCHOR,
-    SEED_FINALIZATION, SEED_PROOF, SEED_STATE,
+    AnchorRecord, FinalizationRecord, LightClientState, ANCHOR_RECORD_LEN, FINALIZATION_RECORD_LEN,
+    LIGHT_CLIENT_LEN, SEED_ANCHOR, SEED_FINALIZATION, SEED_STATE,
 };
 use crate::wire::{public_values, FinalizationOutput};
 
@@ -43,9 +42,8 @@ pub fn process_instruction(
             finalized_root,
             program_vk,
         ),
-        ZkasperInstruction::StageProof { proof } => stage_proof(program_id, accounts, proof),
-        ZkasperInstruction::SubmitFinalization { output } => {
-            submit_finalization(program_id, accounts, &output)
+        ZkasperInstruction::SubmitFinalization { proof, output } => {
+            submit_finalization(program_id, accounts, proof, &output)
         }
         ZkasperInstruction::AssertFinalized {
             authority,
@@ -56,8 +54,9 @@ pub fn process_instruction(
             authority,
             state_root,
         } => assert_anchored(program_id, accounts, &authority, &state_root),
-        ZkasperInstruction::VerifyOnly { output } => verify_only(program_id, accounts, &output),
-        ZkasperInstruction::CloseProofBuffer => close_proof_buffer(program_id, accounts),
+        ZkasperInstruction::VerifyOnly { proof, output } => {
+            verify_only(program_id, accounts, proof, &output)
+        }
     }
 }
 
@@ -146,79 +145,13 @@ fn initialize(
 }
 
 // ---------------------------------------------------------------------------
-// staging
-// ---------------------------------------------------------------------------
-
-/// Park a PLONK proof in the submitter's buffer, creating the buffer on first
-/// use.
-///
-/// This is the first of the two transactions a submission takes. It runs no
-/// cryptography, so it needs no compute-budget raise, and it is safe to repeat:
-/// re-staging overwrites.
-fn stage_proof(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    proof: &[u8; PROOF_LEN],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
-    let buffer_info = next_account_info(iter)?;
-    let system = next_account_info(iter)?;
-
-    if !payer.is_signer {
-        return Err(ZkasperError::MissingSigner.into());
-    }
-    if !system_program::check_id(system.key) {
-        return Err(ProgramError::IncorrectProgramId);
-    }
-
-    let bump = expect_buffer(program_id, payer, buffer_info)?;
-    if buffer_info.data_is_empty() {
-        create_pda(
-            program_id,
-            payer,
-            buffer_info,
-            system,
-            PROOF_BUFFER_LEN,
-            &[SEED_PROOF, payer.key.as_ref(), &[bump]],
-        )?;
-    } else if buffer_info.owner != program_id {
-        return Err(ZkasperError::InvalidProofBuffer.into());
-    }
-
-    write_proof(&mut buffer_info.try_borrow_mut_data()?, bump, proof)?;
-    Ok(())
-}
-
-/// Give the buffer's rent back and hand the account to the system program.
-fn close_proof_buffer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
-    let buffer_info = next_account_info(iter)?;
-
-    if !payer.is_signer {
-        return Err(ZkasperError::MissingSigner.into());
-    }
-    expect_buffer(program_id, payer, buffer_info)?;
-    if buffer_info.owner != program_id {
-        return Err(ZkasperError::InvalidProofBuffer.into());
-    }
-
-    let refund = buffer_info.lamports();
-    **buffer_info.try_borrow_mut_lamports()? = 0;
-    **payer.try_borrow_mut_lamports()? += refund;
-    buffer_info.resize(0)?;
-    buffer_info.assign(&system_program::id());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // submit_finalization
 // ---------------------------------------------------------------------------
 
 fn submit_finalization(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
+    proof: &[u8; COMPRESSED_PROOF_LEN],
     output: &FinalizationOutput,
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
@@ -226,7 +159,6 @@ fn submit_finalization(
     let state_info = next_account_info(iter)?;
     let record_info = next_account_info(iter)?;
     let anchor_info = next_account_info(iter)?;
-    let buffer_info = next_account_info(iter)?;
     let system = next_account_info(iter)?;
 
     if !payer.is_signer {
@@ -319,7 +251,7 @@ fn submit_finalization(
         return Err(ZkasperError::AccountAlreadyInitialized.into());
     }
 
-    verify_staged(program_id, payer, buffer_info, &state.program_vk, output)?;
+    verify(proof, &state.program_vk, output)?;
 
     // Both halves of one accumulator move together: the far end of the
     // transition, and the epoch that end belongs to. The guest asserts the two
@@ -390,27 +322,15 @@ fn submit_finalization(
 fn verify_only(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
+    proof: &[u8; COMPRESSED_PROOF_LEN],
     output: &FinalizationOutput,
 ) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let state_info = next_account_info(iter)?;
-    let buffer_info = next_account_info(iter)?;
+    let state_info = next_account_info(&mut accounts.iter())?;
     if state_info.owner != program_id {
         return Err(ZkasperError::InvalidStateAccount.into());
     }
     let program_vk = LightClientState::unpack(&state_info.try_borrow_data()?)?.program_vk;
-    // The buffer is named rather than derived: `verify_only` writes nothing, so
-    // anyone may point it at anyone's staged proof.
-    if buffer_info.owner != program_id {
-        return Err(ZkasperError::InvalidProofBuffer.into());
-    }
-    let data = buffer_info.try_borrow_data()?;
-    crate::plonk::verify(
-        staged_proof(&data)?,
-        &program_vk,
-        &public_values(output, &program_vk),
-    )
-    .map_err(Into::into)
+    verify(proof, &program_vk, output).map_err(Into::into)
 }
 
 /// The one place a proof is checked.
@@ -418,25 +338,16 @@ fn verify_only(
 /// Both halves of the statement — the guest key and the public window — come
 /// from the light client and from `output`; the submission carries neither the
 /// key nor the padded window, so neither can be chosen to fit a proof.
-fn verify_staged(
-    program_id: &Pubkey,
-    payer: &AccountInfo,
-    buffer_info: &AccountInfo,
+///
+/// The proof is expanded before anything reads it, so the transcript is built
+/// over the same 768 bytes an uncompressed submission would have carried.
+fn verify(
+    proof: &[u8; COMPRESSED_PROOF_LEN],
     program_vk: &[u8; 32],
     output: &FinalizationOutput,
 ) -> Result<(), ZkasperError> {
-    expect_buffer(program_id, payer, buffer_info)?;
-    if buffer_info.owner != program_id {
-        return Err(ZkasperError::InvalidProofBuffer);
-    }
-    let data = buffer_info
-        .try_borrow_data()
-        .map_err(|_| ZkasperError::InvalidProofBuffer)?;
-    crate::plonk::verify(
-        staged_proof(&data)?,
-        program_vk,
-        &public_values(output, program_vk),
-    )
+    let proof = crate::plonk::decompress_proof(proof)?;
+    crate::plonk::verify(&proof, program_vk, &public_values(output, program_vk))
 }
 
 // ---------------------------------------------------------------------------
@@ -507,21 +418,6 @@ fn expect_pda(
         return Err(err);
     }
     Ok(bump)
-}
-
-/// The buffer belongs to the signer, so a submission can only ever verify a
-/// proof that signer staged.
-fn expect_buffer(
-    program_id: &Pubkey,
-    payer: &AccountInfo,
-    buffer_info: &AccountInfo,
-) -> Result<u8, ZkasperError> {
-    expect_pda(
-        program_id,
-        buffer_info,
-        &[SEED_PROOF, payer.key.as_ref()],
-        ZkasperError::InvalidProofBuffer,
-    )
 }
 
 fn create_pda<'a>(
