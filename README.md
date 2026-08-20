@@ -17,12 +17,13 @@ anywhere in Zisk. The verifier here is a transliteration of the Solidity verifie
 Zisk ships as `zisk-contracts/PlonkVerifier.sol`, with every precompile call
 replaced by the matching syscall.
 
-> **Status: the verifier is real and the proof it verifies is real.**
-> [`fixtures/wrap-469426.json`](fixtures/README.md) is an actual `wrap --plonk`
-> output, and the tests run it through the compiled program. What it is a proof
-> *of* is a stand-in guest that commits its input verbatim, not zkasper's own
-> finalization guest — see `fixtures/README.md`. Binding a deployment to the real
-> guest is one 32-byte value at bootstrap and nothing else.
+> **Status: the proof is a mainnet Ethereum epoch, and the program verifies it.**
+> [`fixtures/wrap-469891.json`](fixtures/README.md) is a `wrap --plonk` of a
+> proof `zkasperd` produced in production for mainnet epoch 469891 — finalizing
+> 469890 — and the tests run it through the compiled program. The guest is
+> zkasper's own streaming finalization guest, so what verifies is a claim about
+> Casper FFG and not about a stand-in. Nothing has been submitted to a cluster
+> under this pin; the devnet deployment still runs the previous build.
 
 ## One transaction
 
@@ -52,14 +53,18 @@ bytes and did not fit the 1,232-byte packet; compression was the only thing
 making a submission one transaction. The ring removed both accounts and 67 bytes
 of keys and account indices with them, so an uncompressed proof now fits — by
 eleven bytes. It stays compressed anyway, and not out of habit: eleven bytes is
-not a margin, and `GUEST_COMMITS_PROGRAM_VK` (below) adds 32 bytes to the
-committed output the instruction carries verbatim, which puts the uncompressed
-form back over the limit. The test asserts that margin rather than the old
-inequality.
+not a margin. The test asserts that margin rather than the old inequality.
 
 The instruction data is 657 bytes: one tag, 480 of compressed proof, 176 of
 output. Nothing is staged, so there is no buffer account, no second signature and
 no second fee.
+
+It is the same 657 bytes it was before the v1.1.0-alpha repin, which is worth
+stating because two things about the proof grew and neither reached the wire. The
+public window went from 256 bytes to 512, and the guest's committed output from
+176 to 208 — but the window is rebuilt on chain, and the 32 bytes the output grew
+by are the key the program *already pins*. A submitter still sends 176 bytes and
+still never names the key.
 
 Decompression must be exact, not merely correct, because the Fiat-Shamir
 transcript hashes the proof's *wire bytes*. `alt_bn128_g1_decompress` returns the
@@ -74,18 +79,24 @@ membership.
 
 ## Measured cost
 
-A submission costs **476,587 compute units**, which does **not** fit Solana's
+A submission costs **477,279 compute units**, which does **not** fit Solana's
 200,000-unit default: every submitter must raise the limit with
 `ComputeBudgetProgram`. 700,000 is the value the CLI asks for.
 
 | Path | Compute units |
 | --- | --- |
-| `submit_finalization` — decompress, verify, advance state, write one ring entry | **476,587** |
-| `verify_only` — decompression and PLONK verification alone | 472,530 |
+| `submit_finalization` — decompress, verify, advance state, write one ring entry | **477,279** |
+| `verify_only` — decompression and PLONK verification alone | 473,222 |
 | `assert_finalized` — index the ring by epoch, on a full ring | 2,412 |
 | `assert_anchored` — a pass over all 128 entries, no match | 3,181 |
 | `assert_anchored` — the same, matching in the last slot reached | 3,337 |
-| `initialize` — trusted bootstrap, and the ring's one allocation | 10,788 |
+| `initialize` — trusted bootstrap, and the ring's one allocation | 12,288 |
+
+Verifying under v1.1.0-alpha costs **692 units more** than under v1.0.0-alpha,
+and all of it is the public window: the SHA-256 preimage went from 320 bytes to
+576, which is four more compression blocks, and the window is now scattered four
+bytes to a slot instead of copied. The nine decompressions, eighteen scalar
+multiplications and the pairing are untouched.
 
 The by-epoch lookup does not read the ring's other 127 entries, so it costs the
 same whether the ring is empty or full, and it is *cheaper* than the per-epoch
@@ -123,13 +134,15 @@ the compiled SBPF v3 program running the real wrapped proof; reproduce with
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs).
 
 The same submission on a real `solana-test-validator` — `./scripts/demo.sh`,
-which generates a fresh payer each run — costs **476,587**, to the unit. It used
-to cost a little more than the measurement, and the gap was bump seeds:
-`find_program_address` walks downwards from 255 at 1,500 units an attempt, and a
-different authority lands on different bumps for its PDAs. A submission no longer
-runs that walk for anything — the state and the ring each name the bump they were
-derived under — so the number is the same for every authority. `initialize` still
-walks, and still varies.
+which generates a fresh payer each run — matched the measurement to the unit
+under the previous pin, 476,587 against 476,587. That run has not been repeated
+here and the figure above is LiteSVM's, but nothing in the repin touches why the
+two agree: a submission used to cost a little more than the measurement, and the
+gap was bump seeds. `find_program_address` walks downwards from 255 at 1,500
+units an attempt, and a different authority lands on different bumps for its
+PDAs. A submission no longer runs that walk for anything — the state and the ring
+each name the bump they were derived under — so the number is the same for every
+authority. `initialize` still walks, and still varies.
 
 Where it goes, from `cargo test -p zkasper-plonk-cost -- --nocapture`, which
 prices each piece in its own transaction:
@@ -137,13 +150,18 @@ prices each piece in its own transaction:
 | | units |
 | --- | --- |
 | eighteen `alt_bn128` scalar multiplications | 116,334 (6,463 each) |
-| one pairing of two pairs | 49,088 |
+| one pairing of two pairs | 49,087 |
 | eighteen point additions | 7,524 (418 each) |
-| one `Fr` inversion, in software | 50,682 |
-| the public input, one SHA-256 over 320 bytes | 10,612 |
+| one `Fr` inversion, in software | 50,796 |
+| the public input, one SHA-256 over 576 bytes | 10,771 |
 | the Fiat-Shamir transcript, six keccaks | 1,642 |
-| everything else: about a hundred `Fr` multiplications at 1,990 each, and the byte conversions between them | 231,379 |
-| **verification, net of the 13,020-unit baseline** | **467,261** |
+| everything else: about a hundred `Fr` multiplications at 1,988 each, and the byte conversions between them | 231,234 |
+| **verification, net of the 13,685-unit baseline** | **467,388** |
+
+The inversion and the pairing move by a few dozen units between proofs and this
+is not noise: extended Euclid is data-dependent, so a different proof inverts a
+different field element in a different number of steps. The baseline moved for a
+reason of its own — it now includes rebuilding the wider window.
 
 Note the scalar multiplications cost 6,463 rather than the 3,840 Solana's own
 table quotes, and the additions 418 rather than 334. Those are the measured
@@ -302,7 +320,7 @@ handed out, only `FinalizationRing::entry`, which compares before it returns.
 
 snarkjs's Solidity verifier opens with `checkProofData`: nine tests that each G1
 commitment satisfies `y^2 = x^3 + 3`, with both coordinates below the base field
-modulus. This program does not run it, and that is worth 104,679 units — a fifth
+modulus. This program does not run it, and that is worth 104,667 units — a fifth
 of the whole submission.
 
 The reason is that every one of the nine commitments is an operand to an
@@ -335,15 +353,28 @@ Zisk's wrap commits exactly one public input:
 PI = sha256( programVK || publicValues || rootCVadcopFinal )  mod r
 ```
 
-with `publicValues` the fixed 256-byte window Zisk pads the guest's committed
-output into. Three things therefore decide what a verifying proof *means*, and
-the program holds all three. None of them is read from a submission:
+with `publicValues` the fixed window Zisk spreads the guest's committed output
+into — 64 slots, four bytes of output each, rendered at `u64` width, so 512
+bytes. Three things therefore decide what a verifying proof *means*, and the
+program holds all three. None of them is read from a submission:
 
 | | what it pins | where it lives | changes when |
 | --- | --- | --- | --- |
 | `programVK` | which guest ran | `LightClientState`, written once at `Initialize` | zkasper ships a new guest |
 | `rootCVadcopFinal` | which VADCOP final verification key the recursion terminated at | [`program/src/plonk/vk.rs`](program/src/plonk/vk.rs) | Zisk ships a new release |
-| `Qm..Qc`, `S1..S3`, `X_2`, `w`, `k1`, `k2`, `n` | which wrap circuit | the same module | the same |
+| `Qm..Qc`, `S1..S3` | which wrap circuit | the same module | the same |
+
+`X_2`, `w`, `k1`, `k2` and `n` are in that module too and are *not* release
+constants: they were byte-identical across v1.0.0-alpha and v1.1.0-alpha, which
+is the same SRS, the same root of unity and the same domain. Eight points and
+`rootCVadcopFinal` are the whole of a release change, plus the window width.
+
+The three fields are encoded two different ways in the one preimage, which is a
+trap worth naming: `programVK` and `rootCVadcopFinal` are four `u64`s
+**big-endian**, and the publics between them are little-endian. The same guest
+key therefore appears twice in the digest in two encodings — once as the
+`programVK` prefix, and once inside the window where the guest wrote it — and
+`wire::guest_program_vk` is the eight-byte reversal between them.
 
 The split is deliberate. `programVK` is zkasper's and moves on zkasper's
 schedule, so it is deployment configuration and a new guest is a new light
@@ -354,15 +385,17 @@ upgrade. They live in one module rather than three so they cannot drift apart.
 Zisk execution produced these public values. Which execution is exactly what
 `programVK` names. If the submitter supplied it, anyone could write a guest whose
 entire body is "commit these 176 bytes", prove it in a few minutes, wrap it, and
-submit a genuine proof of an Ethereum finality that never happened — the fixture
-in this repository is that guest, which is why it verifies here and would be
-rejected by a light client bootstrapped on the real one. The same argument
-applies to `rootCVadcopFinal`: it names the STARK verifier the recursion ends at,
-so a submitter who chose it could point at a verifier they set up themselves.
+submit a genuine proof of an Ethereum finality that never happened. The fixture
+this repository used to carry was exactly that guest; the one it carries now is
+zkasper's, and the difference between them is the 32 bytes a light client pins.
+The same argument applies to `rootCVadcopFinal`: it names the STARK verifier the
+recursion ends at, so a submitter who chose it could point at a verifier they set
+up themselves.
 
 The 176 bytes the instruction carries are the whole of what a submitter gets to
-say, and the program re-expands them into the 256-byte window itself. Padding is
-not a free field either: a byte written past the output changes the digest.
+say, and the program re-expands them into the 512-byte window itself. Padding is
+not a free field either, and neither is the half of every slot the guest cannot
+reach: a byte written into either changes the digest.
 
 `public_bytes()` is zkasper's own encoding, mirrored byte for byte in
 [`program/src/wire.rs`](program/src/wire.rs):
@@ -386,12 +419,12 @@ runs and the only one on the latency path. The batch pipeline's
 
 zkasper appended one more field to that struct on 2026-08-19: the guest's own
 `program_vk`, taking the committed output to 208 bytes.
-`GUEST_COMMITS_PROGRAM_VK` in `wire.rs` is the switch for it, and it is `false`
-because the only wrapped proof that exists predates the change. When it is
-flipped, the program appends **the key it already pinned**, which is exactly the
-comparison zkasper's `types.rs` asks an on-chain verifier to make — a proof whose
-guest committed any other key produces a different digest and fails. The
-submitter never names it, either way.
+`GUEST_COMMITS_PROGRAM_VK` in `wire.rs` is the switch for it, and it is `true` —
+the fixture is a production proof from after that change, and slots 44..52 of its
+window hold the key. The program appends **the key it already pinned**, which is
+exactly the comparison zkasper's `types.rs` asks an on-chain verifier to make: a
+proof whose guest committed any other key produces a different digest and fails.
+The submitter never names it, and the instruction never carries it.
 
 Proofs use the EIP-197 encoding the `alt_bn128` syscalls expect: G1 is `x || y`
 as two 32-byte big-endian values, G2 is `x.c1 || x.c0 || y.c1 || y.c0`. The 24
@@ -515,53 +548,52 @@ program-tests/ LiteSVM integration tests, the cost measurements, and the
                off-chain tests that run the real proof through the same verifier
 plonk-cost/    the same verifier under a mode dispatch, so the cost decomposes
 cli/           command-line client used by the demo
-fixtures/      the one wrapped proof that exists
+fixtures/      the wrapped production proof the tests run
 ```
 
 ## Going live
 
-The program is done. Everything below is something **zkasper** or **Zisk** must
-produce.
+The program is done, and so are the first four items that used to be here: a
+production zkasper proof has been wrapped, the verifier is pinned to
+v1.1.0-alpha, the guest key is the one that proof carries, and
+`GUEST_COMMITS_PROGRAM_VK` is `true`. What is left is deployment and upstream.
 
-1. **Wrap a real zkasper proof.** The fixture is a wrap of a stand-in guest. Four
-   things block wrapping the real one, and they are upstream, not here:
-   `wrap --plonk` consumes an *uncompressed* VADCOP final proof that
-   `zkasperd`'s prover currently throws away; the v1.1.0-alpha SNARK proving key
-   Zisk published is a 660 KB macOS `.dylib` rather than the 21.9 GB key;
-   v1.0.0-alpha's md5 manifest names the wrong filename, so `ziskup setup_snark`
-   fails its own check; and `cargo-zisk verify` on a PLONK proof shells out to
-   `snarkjs`, which nothing in the toolchain installs.
+1. **Make wrapping reproducible.** The fixture was produced by a `cargo-zisk`
+   built from `9a5a1ac` with a one-line patch: `backend.plonk()` passes the guest
+   program VK as proofman's `verkey_override`, where a plain vadcop_final leaf
+   needs the vadcop_final verkey, and every stock attempt dies in `VerifyPoW`.
+   The same call also stamps `rootc` from the publics rather than from the verkey
+   it stamped, so the raw output had to be corrected in place before snarkjs
+   would take it. Both belong upstream. Until they are there, a wrap is not
+   something an operator can reproduce from a release.
 
-2. **Pin the Zisk release the deployment verifies under.** The circuit constants
-   and `rootCVadcopFinal` in `plonk/vk.rs` are v1.0.0-alpha's. v1.1.0-alpha has
-   different selector commitments, stamps a different value in
-   `rootCVadcopFinal`, and renders `publicValues` as 512 bytes rather than 256 —
-   three separate reasons a v1.1.0 proof will not verify against a v1.0.0 build.
-   Transcribe the new ones from that release's `PlonkVerifier.sol` and re-run the
-   tests against a proof from it.
+2. **Settle which `vadcop_final` verkey is canonical.** `plonk/vk.rs` pins the
+   2026-08-17 value, because that is the proving key zkasper's provers hold and
+   the only one a production proof wraps under. Upstream reissued the file on
+   2026-08-19 and `ZiskVerifier.sol` returns the new value. A deployment is
+   pinned to whichever key its provers actually have, and that ought to be
+   stated by upstream rather than discovered.
 
 3. **Publish the finalization guest's `programVK`** — the four `u64` words. It is
    bound at bootstrap and is the whole of what stops a proof of another program
-   being accepted.
+   being accepted. The fixture's is
+   `0xe4f20c6ec9d0ad4d2d764e8403b73737844c3ba8df033ac13fb2d6bde471197d`,
+   big-endian, which is the encoding `Initialize` takes.
 
-4. **Decide `GUEST_COMMITS_PROGRAM_VK`.** zkasper's `StreamFinalOutput` now
-   commits the guest key as a trailing field; the fixture predates it. Whichever
-   is true of the proof being wrapped has to be true of this constant.
-
-5. **Pick a bootstrap checkpoint** and publish `accumulator_commitment`,
+4. **Pick a bootstrap checkpoint** and publish `accumulator_commitment`,
    `latest_state_root`, `finalized_epoch` and `finalized_root` for it, along with
    how they were derived, so consumers can check the starting point themselves.
    Note that `accumulator_commitment` is the accumulator of `finalized_epoch + 1`
    — see "Accumulator chaining" — so publish which epoch it belongs to as well.
 
-6. **Close the `epoch-diff` succession gap, or ship the anchor check.** If the
+5. **Close the `epoch-diff` succession gap, or ship the anchor check.** If the
    gap stays open, every consumer needs the anchor walk described above, and that
    requirement belongs in zkasper's own documentation, not only here. Say there
    that the walk can only be completed on chain for state roots from the last 128
    epochs; a consumer walking further back has to have collected the answers
    while they were still there.
 
-7. **Record the trusted setup as an assumption.** The Zisk STARK is transparent;
+6. **Record the trusted setup as an assumption.** The Zisk STARK is transparent;
    the PLONK wrap is not. Its structured reference string arrives as a 21.9 GB
    `final.zkey` from a bucket, with an md5 and no ceremony transcript. Anyone
    verifying a wrapped zkasper proof trusts a setup they cannot audit. That is a
@@ -580,8 +612,13 @@ keypair. A real deployment generates its own, keeps it private, and updates
 
 ```sh
 ZKASPER_POSTINGS=/var/lib/zkasper/postings.jsonl \
-  zkasper-cli https://api.devnet.solana.com payer.json submit fixtures/wrap-469426.json
+  zkasper-cli https://api.devnet.solana.com payer.json submit fixtures/wrap-469891.json
 ```
+
+The record below is the one the devnet submission of the previous fixture
+produced, kept because it is a real receipt rather than a sketch. Nothing has
+been submitted under the v1.1.0-alpha pin, so the epoch and the compute units are
+that submission's:
 
 ```json
 {"chain":"solana-devnet","cluster":"devnet","epoch":469425,"signature":"4Jr…","slot":11,

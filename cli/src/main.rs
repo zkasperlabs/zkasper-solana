@@ -38,13 +38,14 @@ use solana_transaction::Transaction;
 use serde_json::{json, Value};
 
 use zkasper_solana_program::instruction as ix;
+use zkasper_solana_program::plonk::vk::PUBLIC_VALUES_LEN;
 use zkasper_solana_program::plonk::{compress_proof, COMPRESSED_PROOF_LEN};
 use zkasper_solana_program::state::{
     finalization_ring_address, light_client_address, LightClientState, RING_ENTRIES,
 };
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// A submission measures 476,587 units for the whole transaction; this leaves
+/// A submission measures 477,279 units for the whole transaction; this leaves
 /// headroom without overpaying for a limit the runtime reserves block space
 /// against.
 const COMPUTE_UNIT_LIMIT: u32 = 700_000;
@@ -94,10 +95,15 @@ struct Wrap {
 fn read_wrap(path: &str) -> Wrap {
     let raw = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
     let publics = wrap_field(&raw, "publicValues");
-    let head: [u8; FINALIZATION_PUBLIC_BYTES] = publics
-        .get(..FINALIZATION_PUBLIC_BYTES)
-        .and_then(|s| s.try_into().ok())
-        .unwrap_or_else(|| die("publicValues is shorter than one finalization output"));
+    if publics.len() != PUBLIC_VALUES_LEN {
+        die("publicValues is not the window width plonk::vk pins");
+    }
+    // Four bytes to a slot: the window renders each public at u64 width, so the
+    // guest's output is every other half of it. See `wire::public_values`.
+    let mut head = [0u8; FINALIZATION_PUBLIC_BYTES];
+    for (four, slot) in head.chunks_exact_mut(4).zip(publics.chunks_exact(8)) {
+        four.copy_from_slice(&slot[..4]);
+    }
     Wrap {
         program_vk: wrap_field(&raw, "programVK")
             .try_into()
@@ -254,7 +260,7 @@ fn main() {
             let path = args
                 .get(3)
                 .map(String::as_str)
-                .unwrap_or("fixtures/wrap-469426.json");
+                .unwrap_or("fixtures/wrap-469891.json");
             let wrap = read_wrap(path);
             // Bootstrap one epoch below the proof, on the accumulator it starts
             // from, so the demo has something the proof can advance. A real
@@ -277,7 +283,7 @@ fn main() {
             let path = args
                 .get(3)
                 .map(String::as_str)
-                .unwrap_or("fixtures/wrap-469426.json");
+                .unwrap_or("fixtures/wrap-469891.json");
             let wrap = read_wrap(path);
             println!("submitting epoch {}", wrap.output.finalized_epoch);
             let signature = send(
