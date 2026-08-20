@@ -25,7 +25,7 @@ pub mod processor;
 pub mod state;
 pub mod wire;
 
-solana_program::declare_id!("Cuarryex9DFpVm6HNdCFvpS3EEeArSuTXDMNTk9hpKja");
+solana_program::declare_id!("2yXFbgLjFk7e5nyfdv5CSEEmpqEPbxLgrvNhxANYbTMn");
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(entry);
