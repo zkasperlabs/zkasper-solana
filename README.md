@@ -57,13 +57,13 @@ is refundable with `close_proof_buffer`.
 
 ## Measured cost
 
-A submission costs **479,423 compute units**, which does **not** fit Solana's
+A submission costs **481,004 compute units**, which does **not** fit Solana's
 200,000-unit default: every submitter must raise the limit with
 `ComputeBudgetProgram`. 700,000 is the value the CLI asks for.
 
 | Path | Compute units |
 | --- | --- |
-| `submit_finalization` — verify, advance state, write two records | **479,423** |
+| `submit_finalization` — verify, advance state, write two records | **481,004** |
 | `verify_only` — PLONK verification alone | 467,021 |
 | `stage_proof` — write 768 bytes, no cryptography | 4,872 |
 | `assert_finalized` / `assert_anchored` — read path | 3,731 |
@@ -75,11 +75,11 @@ the compiled SBPF v3 program running the real wrapped proof; reproduce with
 `./scripts/test.sh`, and see `measures_compute_units` in
 [`program-tests/tests/verifier.rs`](program-tests/tests/verifier.rs).
 
-The same submission on a real `solana-test-validator` — `./scripts/demo.sh` —
-consumed **488,465**. The gap is bump seeds: `find_program_address` walks
-downwards from 255 at 1,500 units an attempt, and a different authority lands on
-different bumps for its three PDAs. Budget for the variance rather than the
-measurement.
+The same submission on a real `solana-test-validator` — `./scripts/demo.sh`,
+which generates a fresh payer each run — consumed **485,504**. The gap is bump
+seeds: `find_program_address` walks downwards from 255 at 1,500 units an attempt,
+and a different authority lands on different bumps for its four PDAs. Budget for
+the variance rather than for the measurement.
 
 Where it goes, from `cargo test -p zkasper-plonk-cost -- --nocapture`, which
 prices each piece in its own transaction:
@@ -431,7 +431,7 @@ ZKASPER_POSTINGS=/var/lib/zkasper/postings.jsonl \
 
 ```json
 {"chain":"solana-devnet","cluster":"devnet","epoch":469425,"signature":"4Jr…","slot":11,
- "compute_units":479423,"fee_lamports":5000,"rent_lamports":2867520,"lamports_spent":2872520,
+ "compute_units":481004,"fee_lamports":5000,"rent_lamports":2867520,"lamports_spent":2872520,
  "status":"confirmed","explorer":"https://explorer.solana.com/tx/4Jr…?cluster=devnet","…":""}
 ```
 

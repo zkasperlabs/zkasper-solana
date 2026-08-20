@@ -226,12 +226,21 @@ fn submit_finalization(
         return Err(ZkasperError::InvalidStateAccount.into());
     }
 
-    // Only `initialize` writes `TAG_LIGHT_CLIENT`, and it does so through
-    // `invoke_signed` under `[SEED_STATE, authority]`. An account this program
-    // owns that carries that tag is therefore already known to sit at the PDA
-    // for the authority it names, and re-deriving it here would buy nothing.
     let mut state = LightClientState::unpack(&state_info.try_borrow_data()?)?;
     let authority = state.authority;
+
+    // The account names its own authority and bump, so confirming it is the PDA
+    // for that authority is one hash rather than the eight-attempt walk
+    // `find_program_address` would run. Without it, the safety of everything
+    // below would rest on no other account type this program owns ever carrying
+    // `TAG_LIGHT_CLIENT` at offset zero -- true today, and an invariant spread
+    // across two modules and enforced by one byte constant.
+    if Pubkey::create_program_address(&[SEED_STATE, authority.as_ref(), &[state.bump]], program_id)
+        .map_err(|_| ZkasperError::InvalidStateAccount)?
+        != *state_info.key
+    {
+        return Err(ZkasperError::InvalidStateAccount.into());
+    }
 
     // Cheap rejections before the verification, so a replayed, stale or
     // off-chain proof costs the submitter a few hundred units rather than the

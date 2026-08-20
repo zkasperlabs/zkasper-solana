@@ -96,6 +96,11 @@ pub enum ZkasperInstruction<'a> {
     /// paying for account creation, and isolates the cost of verification when
     /// measuring compute units.
     ///
+    /// **Not an assertion, and not for CPI.** It names no authority and derives
+    /// neither account, so success means "some proof verifies against some guest
+    /// key" -- and the caller of the outer transaction chose both. Use
+    /// [`Self::AssertFinalized`] or [`Self::AssertAnchored`] to gate anything.
+    ///
     /// Accounts:
     /// 0. `[]` light-client state PDA
     /// 1. `[]` proof buffer PDA holding the proof to check

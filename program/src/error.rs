@@ -7,7 +7,6 @@ use solana_program::program_error::ProgramError;
 pub enum ZkasperError {
     InvalidInstructionData = 0,
     AccountAlreadyInitialized = 1,
-    AccountNotInitialized = 2,
     WrongAccountTag = 3,
     InvalidStateAccount = 4,
     InvalidRecordAccount = 5,
@@ -22,9 +21,6 @@ pub enum ZkasperError {
     CheckpointNotFinalized = 10,
     /// No finalization proof has ever named this beacon state root.
     StateRootNotAnchored = 11,
-    /// A public input was not a canonical BN254 scalar.
-    InvalidPublicInput = 12,
-    InvalidVerifyingKey = 13,
     AccountDataTooSmall = 14,
     /// The finalization starts from an accumulator this client does not hold.
     ///

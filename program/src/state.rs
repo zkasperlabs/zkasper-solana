@@ -107,6 +107,12 @@ pub struct LightClientState {
     /// Epoch the stored accumulator was proven against: the `justified_epoch` of
     /// the last accepted proof, which is the far end of the transition that
     /// proof covered.
+    ///
+    /// The program does not constrain it, and does not need to: the guest
+    /// asserts "justification epochs not consecutive" unless
+    /// `justified_epoch == finalized_epoch + 1`
+    /// (`crates/stream-final-guest/src/lib.rs`), and `finalized_epoch` has to
+    /// strictly increase to be accepted here.
     pub accumulator_epoch: u64,
 }
 
@@ -160,10 +166,6 @@ impl LightClientState {
             .copy_from_slice(&self.accumulator_epoch.to_le_bytes());
         Ok(())
     }
-
-    pub fn is_initialized(data: &[u8]) -> bool {
-        data.len() >= LIGHT_CLIENT_LEN && data[OFF_TAG] == TAG_LIGHT_CLIENT
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +185,8 @@ pub const FINALIZATION_RECORD_LEN: usize = 114;
 /// One accepted finalization, addressed by epoch and never rewritten.
 ///
 /// This is the read path: a consumer derives
-/// `[SEED_FINALIZATION, epoch.to_le_bytes()]` and reads the account, or CPIs
+/// `[SEED_FINALIZATION, authority, epoch.to_le_bytes()]` and reads the account,
+/// or CPIs
 /// [`crate::instruction::ZkasperInstruction::AssertFinalized`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalizationRecord {
