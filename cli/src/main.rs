@@ -11,6 +11,9 @@
 //! zkasper-cli <rpc-url> <keypair.json> assert-anchored  <state-root-hex>
 //! ```
 //!
+//! Both assertions read the finalization ring, which keeps the last 128 epochs
+//! — about 13.6 hours. Anything older is no longer on chain.
+//!
 //! A submission is one transaction. `submit` compresses the wrap's nine G1
 //! commitments, which halves each of them and is what makes the proof fit a
 //! packet beside the output it attests to.
@@ -36,10 +39,12 @@ use serde_json::{json, Value};
 
 use zkasper_solana_program::instruction as ix;
 use zkasper_solana_program::plonk::{compress_proof, COMPRESSED_PROOF_LEN};
-use zkasper_solana_program::state::{light_client_address, LightClientState};
+use zkasper_solana_program::state::{
+    finalization_ring_address, light_client_address, LightClientState, RING_ENTRIES,
+};
 use zkasper_solana_program::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
-/// A submission measures 484,908 units for the whole transaction; this leaves
+/// A submission measures 476,587 units for the whole transaction; this leaves
 /// headroom without overpaying for a limit the runtime reserves block space
 /// against.
 const COMPUTE_UNIT_LIMIT: u32 = 700_000;
@@ -172,10 +177,12 @@ fn u64_at(value: &Value, path: &[&str]) -> u64 {
 
 /// What the submission cost and where it landed, as one line of JSON.
 ///
-/// `fee_lamports` is the transaction fee. `rent_lamports` is what the payer
-/// left behind as the rent-exempt balance of the finalization and anchor
-/// records, which is the larger number and is not refundable. Reporting only the
-/// fee would make the posting cheaper than it is.
+/// `fee_lamports` is the transaction fee, and it is now the whole of what a
+/// submission costs: the finalization is written into a ring account that
+/// `initialize` paid for once, so nothing is left behind. `rent_lamports` stays
+/// in the record, reporting the zero, because the field is part of the posting
+/// schema and a consumer comparing postings across deployments should be able to
+/// see it fall to nothing.
 fn posting(client: &RpcClient, signature: &str, output: &FinalizationOutput) -> String {
     let tx = receipt(client, signature);
     let meta = &tx["meta"];
@@ -276,13 +283,7 @@ fn main() {
             let signature = send(
                 &client,
                 &payer,
-                ix::submit_finalization(
-                    &program_id,
-                    &authority,
-                    &payer.pubkey(),
-                    &wrap.proof,
-                    &wrap.output,
-                ),
+                ix::submit_finalization(&program_id, &authority, &wrap.proof, &wrap.output),
             );
             record_posting(&posting(&client, &signature, &wrap.output));
         }
@@ -292,7 +293,9 @@ fn main() {
                 .get_account_data(&address)
                 .unwrap_or_else(|e| die(&format!("{address}: {e}")));
             let state = LightClientState::unpack(&data).unwrap_or_else(|e| die(&format!("{e:?}")));
+            let (ring, _) = finalization_ring_address(&program_id, &authority);
             println!("light client   {address}");
+            println!("ring           {ring} ({RING_ENTRIES} epochs)");
             println!("authority      {}", state.authority);
             println!("finalized      epoch {}", state.finalized_epoch);
             println!("  block root   0x{}", hex::encode(state.finalized_root));
@@ -334,8 +337,10 @@ fn main() {
         }
         "address" => {
             let (address, bump) = light_client_address(&program_id, &authority);
+            let (ring, ring_bump) = finalization_ring_address(&program_id, &authority);
             println!("program  {program_id}");
             println!("state    {address} (bump {bump})");
+            println!("ring     {ring} (bump {ring_bump})");
         }
         other => die(&format!("unknown command: {other}")),
     }

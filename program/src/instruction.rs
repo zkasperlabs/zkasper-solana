@@ -9,7 +9,7 @@ use solana_system_interface::program as system_program;
 
 use crate::error::ZkasperError;
 use crate::plonk::COMPRESSED_PROOF_LEN;
-use crate::state::{anchor_record_address, finalization_record_address, light_client_address};
+use crate::state::{finalization_ring_address, light_client_address};
 use crate::wire::{FinalizationOutput, FINALIZATION_PUBLIC_BYTES};
 
 pub const IX_INITIALIZE: u8 = 0;
@@ -42,7 +42,8 @@ pub enum ZkasperInstruction<'a> {
     /// Accounts:
     /// 0. `[signer, writable]` authority and rent payer
     /// 1. `[writable]`         light-client state PDA
-    /// 2. `[]`                 system program
+    /// 2. `[writable]`         finalization ring PDA
+    /// 3. `[]`                 system program
     Initialize {
         /// The accumulator the epoch above `finalized_epoch` was justified
         /// against — what the first accepted proof must start from.
@@ -61,12 +62,14 @@ pub enum ZkasperInstruction<'a> {
     /// [`crate::plonk::decompress_proof`] for why halving the nine commitments
     /// is what makes a submission one transaction rather than two.
     ///
+    /// Nothing is created and nothing is paid for: the ring already exists and
+    /// the entry is written over the epoch 128 back. So there is no rent payer
+    /// and no system program here, and the only cost is the transaction fee the
+    /// fee payer would owe anyway.
+    ///
     /// Accounts:
-    /// 0. `[signer, writable]` rent payer
-    /// 1. `[writable]`         light-client state PDA
-    /// 2. `[writable]`         finalization record PDA for `finalized_epoch`
-    /// 3. `[writable]`         anchor record PDA for `finalized_state_root`
-    /// 4. `[]`                 system program
+    /// 0. `[writable]` light-client state PDA
+    /// 1. `[writable]` finalization ring PDA
     SubmitFinalization {
         proof: &'a [u8; COMPRESSED_PROOF_LEN],
         output: FinalizationOutput,
@@ -76,20 +79,27 @@ pub enum ZkasperInstruction<'a> {
     ///
     /// `authority` is part of the instruction, not read from the account, so the
     /// caller states which light client it trusts rather than accepting whatever
-    /// record it was handed.
+    /// ring it was handed.
+    ///
+    /// The ring keeps 128 epochs, about 13.6 hours. An older epoch fails with
+    /// [`crate::error::ZkasperError::EpochNotInRing`], which says the claim is
+    /// no longer on chain — not that it was never made.
     ///
     /// Accounts:
-    /// 0. `[]` finalization record PDA for (`authority`, `epoch`)
+    /// 0. `[]` finalization ring PDA for `authority`
     AssertFinalized {
         authority: Pubkey,
         epoch: u64,
         root: [u8; 32],
     },
-    /// Fail unless a proof accepted by `authority`'s light client named
-    /// `state_root`. Intended for CPI.
+    /// Fail unless a proof accepted by `authority`'s light client and still in
+    /// the ring named `state_root`. Intended for CPI.
+    ///
+    /// Answered by a linear pass over the 128 entries, which is what replaces
+    /// the per-state-root account that used to serve as the reverse index.
     ///
     /// Accounts:
-    /// 0. `[]` anchor record PDA for (`authority`, `state_root`)
+    /// 0. `[]` finalization ring PDA for `authority`
     AssertAnchored {
         authority: Pubkey,
         state_root: [u8; 32],
@@ -190,6 +200,7 @@ pub fn initialize(
     program_vk: &[u8; 32],
 ) -> Instruction {
     let (state, _) = light_client_address(program_id, authority);
+    let (ring, _) = finalization_ring_address(program_id, authority);
     let mut data = Vec::with_capacity(INITIALIZE_LEN);
     data.push(IX_INITIALIZE);
     data.extend_from_slice(accumulator_commitment);
@@ -202,6 +213,7 @@ pub fn initialize(
         accounts: vec![
             AccountMeta::new(*authority, true),
             AccountMeta::new(state, false),
+            AccountMeta::new(ring, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
         data,
@@ -211,13 +223,11 @@ pub fn initialize(
 pub fn submit_finalization(
     program_id: &Pubkey,
     authority: &Pubkey,
-    payer: &Pubkey,
     proof: &[u8; COMPRESSED_PROOF_LEN],
     output: &FinalizationOutput,
 ) -> Instruction {
     let (state, _) = light_client_address(program_id, authority);
-    let (record, _) = finalization_record_address(program_id, authority, output.finalized_epoch);
-    let (anchor, _) = anchor_record_address(program_id, authority, &output.finalized_state_root);
+    let (ring, _) = finalization_ring_address(program_id, authority);
     let mut data = Vec::with_capacity(SUBMIT_FINALIZATION_LEN);
     data.push(IX_SUBMIT_FINALIZATION);
     data.extend_from_slice(proof);
@@ -225,11 +235,8 @@ pub fn submit_finalization(
     Instruction {
         program_id: *program_id,
         accounts: vec![
-            AccountMeta::new(*payer, true),
             AccountMeta::new(state, false),
-            AccountMeta::new(record, false),
-            AccountMeta::new(anchor, false),
-            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new(ring, false),
         ],
         data,
     }
@@ -241,7 +248,7 @@ pub fn assert_finalized(
     epoch: u64,
     root: &[u8; 32],
 ) -> Instruction {
-    let (record, _) = finalization_record_address(program_id, authority, epoch);
+    let (ring, _) = finalization_ring_address(program_id, authority);
     let mut data = Vec::with_capacity(ASSERT_FINALIZED_LEN);
     data.push(IX_ASSERT_FINALIZED);
     data.extend_from_slice(authority.as_ref());
@@ -249,7 +256,7 @@ pub fn assert_finalized(
     data.extend_from_slice(root);
     Instruction {
         program_id: *program_id,
-        accounts: vec![AccountMeta::new_readonly(record, false)],
+        accounts: vec![AccountMeta::new_readonly(ring, false)],
         data,
     }
 }
@@ -259,14 +266,14 @@ pub fn assert_anchored(
     authority: &Pubkey,
     state_root: &[u8; 32],
 ) -> Instruction {
-    let (anchor, _) = anchor_record_address(program_id, authority, state_root);
+    let (ring, _) = finalization_ring_address(program_id, authority);
     let mut data = Vec::with_capacity(ASSERT_ANCHORED_LEN);
     data.push(IX_ASSERT_ANCHORED);
     data.extend_from_slice(authority.as_ref());
     data.extend_from_slice(state_root);
     Instruction {
         program_id: *program_id,
-        accounts: vec![AccountMeta::new_readonly(anchor, false)],
+        accounts: vec![AccountMeta::new_readonly(ring, false)],
         data,
     }
 }

@@ -9,18 +9,28 @@ pub enum ZkasperError {
     AccountAlreadyInitialized = 1,
     WrongAccountTag = 3,
     InvalidStateAccount = 4,
-    InvalidRecordAccount = 5,
-    InvalidAnchorAccount = 6,
+    InvalidRingAccount = 5,
     MissingSigner = 7,
     /// The PLONK check failed: a malformed proof, a point off the curve, or a
     /// proof of a statement other than the one claimed.
     ProofVerificationFailed = 8,
     /// `finalized_epoch` did not strictly increase.
     EpochNotAdvancing = 9,
-    /// The record does not name the checkpoint the caller asked about.
+    /// The ring holds the epoch asked about, and it finalized a different root.
     CheckpointNotFinalized = 10,
-    /// No finalization proof has ever named this beacon state root.
+    /// No finalization still in the ring named this beacon state root.
+    ///
+    /// Bounded by the window, like [`Self::EpochNotInRing`]: it means "not in
+    /// the last 128 epochs", not "never".
     StateRootNotAnchored = 11,
+    /// The ring does not carry that epoch — it aged out of the 128-epoch
+    /// window, or this light client has not reached it.
+    ///
+    /// Deliberately not [`Self::CheckpointNotFinalized`]. That one is a claim
+    /// about Ethereum; this one is a claim about how much history is on chain,
+    /// and a consumer that treats "no longer stored" as "never finalized" would
+    /// be reading a fact that was never asserted.
+    EpochNotInRing = 12,
     AccountDataTooSmall = 14,
     /// The finalization starts from an accumulator this client does not hold.
     ///

@@ -11,12 +11,16 @@ use crate::error::ZkasperError;
 use crate::wire::{AccumulatorCommitment, ProgramVk};
 
 pub const TAG_LIGHT_CLIENT: u8 = 1;
-pub const TAG_FINALIZATION_RECORD: u8 = 2;
-pub const TAG_ANCHOR_RECORD: u8 = 3;
+pub const TAG_FINALIZATION_RING: u8 = 2;
+/// Marks a ring slot as written.
+///
+/// A slot nothing has reached yet reads as zeros, and zero is a valid epoch and
+/// a valid root, so this byte is the whole of what separates "never written"
+/// from "epoch 0, root 0x00..00".
+pub const TAG_RING_ENTRY: u8 = 3;
 
 pub const SEED_STATE: &[u8] = b"zkasper-state";
-pub const SEED_FINALIZATION: &[u8] = b"zkasper-fin";
-pub const SEED_ANCHOR: &[u8] = b"zkasper-anchor";
+pub const SEED_RING: &[u8] = b"zkasper-ring";
 
 // ---------------------------------------------------------------------------
 // LightClientState
@@ -140,119 +144,164 @@ impl LightClientState {
 }
 
 // ---------------------------------------------------------------------------
-// FinalizationRecord
+// FinalizationRing
 // ---------------------------------------------------------------------------
 
-const REC_OFF_TAG: usize = 0;
-const REC_OFF_BUMP: usize = 1;
-const REC_OFF_EPOCH: usize = 2;
-const REC_OFF_ROOT: usize = 10;
-const REC_OFF_STATE_ROOT: usize = 42;
-const REC_OFF_ACC: usize = 74;
-const REC_OFF_SLOT: usize = 106;
-
-pub const FINALIZATION_RECORD_LEN: usize = 114;
-
-/// One accepted finalization, addressed by epoch and never rewritten.
+/// How many finalizations the ring keeps.
 ///
-/// This is the read path: a consumer derives
-/// `[SEED_FINALIZATION, authority, epoch.to_le_bytes()]` and reads the account,
-/// or CPIs
-/// [`crate::instruction::ZkasperInstruction::AssertFinalized`].
+/// An Ethereum epoch is 6.4 minutes, so this is **13.6 hours** of history. A
+/// consumer that may be asked about a finalization older than that has to check
+/// the window before relying on the ring; see the README.
+pub const RING_ENTRIES: usize = 128;
+
+const RING_OFF_TAG: usize = 0;
+const RING_OFF_BUMP: usize = 1;
+const RING_HEADER_LEN: usize = 2;
+
+const ENT_OFF_TAG: usize = 0;
+const ENT_OFF_EPOCH: usize = 1;
+const ENT_OFF_ROOT: usize = 9;
+const ENT_OFF_STATE_ROOT: usize = 41;
+
+pub const RING_ENTRY_LEN: usize = 73;
+
+/// 9,346 bytes.
+///
+/// The ceiling is 10,240: a program may grow an account by at most
+/// `MAX_PERMITTED_DATA_INCREASE` in one instruction, and creating a PDA is a
+/// growth from zero, so anything larger could not be allocated at bootstrap in
+/// one go. That budget is why an entry carries exactly what the two read paths
+/// need and nothing else — the retired record's `accumulator_commitment` and
+/// `submitted_slot` would cost 40 bytes an entry, and 128 of those do not fit.
+pub const RING_LEN: usize = RING_HEADER_LEN + RING_ENTRIES * RING_ENTRY_LEN;
+
+/// One accepted finalization, as the ring holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FinalizationRecord {
-    pub bump: u8,
+pub struct FinalizationEntry {
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
+    /// Beacon state root of the finalized block. The reverse index a consumer
+    /// walking an off-chain accumulator chain queries.
     pub finalized_state_root: [u8; 32],
-    pub accumulator_commitment: AccumulatorCommitment,
-    /// Solana slot the proof landed in.
-    pub submitted_slot: u64,
 }
 
-impl FinalizationRecord {
-    pub fn unpack(data: &[u8]) -> Result<Self, ZkasperError> {
-        if data.len() < FINALIZATION_RECORD_LEN {
-            return Err(ZkasperError::AccountDataTooSmall);
-        }
-        if data[REC_OFF_TAG] != TAG_FINALIZATION_RECORD {
-            return Err(ZkasperError::WrongAccountTag);
-        }
-        Ok(Self {
-            bump: data[REC_OFF_BUMP],
-            finalized_epoch: u64_at(data, REC_OFF_EPOCH),
-            finalized_root: a32(data, REC_OFF_ROOT),
-            finalized_state_root: a32(data, REC_OFF_STATE_ROOT),
-            accumulator_commitment: a32(data, REC_OFF_ACC),
-            submitted_slot: u64_at(data, REC_OFF_SLOT),
-        })
-    }
-
-    pub fn pack_into(&self, data: &mut [u8]) -> Result<(), ZkasperError> {
-        if data.len() < FINALIZATION_RECORD_LEN {
-            return Err(ZkasperError::AccountDataTooSmall);
-        }
-        data[REC_OFF_TAG] = TAG_FINALIZATION_RECORD;
-        data[REC_OFF_BUMP] = self.bump;
-        data[REC_OFF_EPOCH..REC_OFF_EPOCH + 8].copy_from_slice(&self.finalized_epoch.to_le_bytes());
-        data[REC_OFF_ROOT..REC_OFF_ROOT + 32].copy_from_slice(&self.finalized_root);
-        data[REC_OFF_STATE_ROOT..REC_OFF_STATE_ROOT + 32]
-            .copy_from_slice(&self.finalized_state_root);
-        data[REC_OFF_ACC..REC_OFF_ACC + 32].copy_from_slice(&self.accumulator_commitment);
-        data[REC_OFF_SLOT..REC_OFF_SLOT + 8].copy_from_slice(&self.submitted_slot.to_le_bytes());
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AnchorRecord
-// ---------------------------------------------------------------------------
-
-const ANC_OFF_TAG: usize = 0;
-const ANC_OFF_BUMP: usize = 1;
-const ANC_OFF_EPOCH: usize = 2;
-const ANC_OFF_STATE_ROOT: usize = 10;
-
-pub const ANCHOR_RECORD_LEN: usize = 42;
-
-/// A beacon state root that some accepted finalization proof named.
+/// The last [`RING_ENTRIES`] accepted finalizations, one account, written in
+/// place at `epoch % RING_ENTRIES`.
 ///
-/// This is the on-chain half of the mitigation for the `epoch-diff` successor
-/// gap. A consumer that follows an off-chain accumulator chain checks that every
-/// state root on that chain has an `AnchorRecord`; forging one needs 2/3 of the
-/// real validator set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AnchorRecord {
-    pub bump: u8,
-    pub finalized_epoch: u64,
-    pub finalized_state_root: [u8; 32],
-}
+/// This is the read path: a consumer derives `[SEED_RING, authority]` and reads
+/// the account, or CPIs
+/// [`crate::instruction::ZkasperInstruction::AssertFinalized`] or
+/// [`crate::instruction::ZkasperInstruction::AssertAnchored`].
+///
+/// A ring replaces one non-closeable account per epoch — 412 billable bytes an
+/// epoch, forever — with one account that is paid for once. What it costs is
+/// depth: a finalization older than [`RING_ENTRIES`] epochs is no longer on
+/// chain, and no read path can answer for it.
+pub struct FinalizationRing;
 
-impl AnchorRecord {
-    pub fn unpack(data: &[u8]) -> Result<Self, ZkasperError> {
-        if data.len() < ANCHOR_RECORD_LEN {
+impl FinalizationRing {
+    /// Stamp the header of a freshly created, zeroed account. Every slot is
+    /// empty until an epoch reaches it.
+    pub fn init(data: &mut [u8], bump: u8) -> Result<(), ZkasperError> {
+        if data.len() < RING_LEN {
             return Err(ZkasperError::AccountDataTooSmall);
         }
-        if data[ANC_OFF_TAG] != TAG_ANCHOR_RECORD {
-            return Err(ZkasperError::WrongAccountTag);
-        }
-        Ok(Self {
-            bump: data[ANC_OFF_BUMP],
-            finalized_epoch: u64_at(data, ANC_OFF_EPOCH),
-            finalized_state_root: a32(data, ANC_OFF_STATE_ROOT),
-        })
+        data[RING_OFF_TAG] = TAG_FINALIZATION_RING;
+        data[RING_OFF_BUMP] = bump;
+        Ok(())
     }
 
-    pub fn pack_into(&self, data: &mut [u8]) -> Result<(), ZkasperError> {
-        if data.len() < ANCHOR_RECORD_LEN {
+    /// The bump the ring was created under, so a reader can confirm the account
+    /// is the ring PDA with one hash rather than a `find_program_address` walk.
+    pub fn bump(data: &[u8]) -> Result<u8, ZkasperError> {
+        Self::header(data)?;
+        Ok(data[RING_OFF_BUMP])
+    }
+
+    /// Overwrite the slot this epoch owns, retiring whatever epoch held it.
+    ///
+    /// The slot is derived from the entry rather than passed in, so no caller
+    /// can write an epoch into a slot that will not be found again.
+    pub fn write(data: &mut [u8], entry: &FinalizationEntry) -> Result<(), ZkasperError> {
+        Self::header(data)?;
+        let at = Self::offset(Self::index_of(entry.finalized_epoch));
+        data[at + ENT_OFF_TAG] = TAG_RING_ENTRY;
+        data[at + ENT_OFF_EPOCH..at + ENT_OFF_EPOCH + 8]
+            .copy_from_slice(&entry.finalized_epoch.to_le_bytes());
+        data[at + ENT_OFF_ROOT..at + ENT_OFF_ROOT + 32].copy_from_slice(&entry.finalized_root);
+        data[at + ENT_OFF_STATE_ROOT..at + ENT_OFF_STATE_ROOT + 32]
+            .copy_from_slice(&entry.finalized_state_root);
+        Ok(())
+    }
+
+    /// The entry for `epoch`, or [`ZkasperError::EpochNotInRing`].
+    ///
+    /// The index alone proves nothing. Slot `epoch % RING_ENTRIES` holds
+    /// whichever congruent epoch was written last, so 128 epochs later the same
+    /// bytes answer for a different epoch. Comparing the stored epoch is the
+    /// whole safety of the ring, and it is done here — the slot is never handed
+    /// out — so no caller can index without it.
+    pub fn entry(data: &[u8], epoch: u64) -> Result<FinalizationEntry, ZkasperError> {
+        Self::header(data)?;
+        Self::slot(data, Self::index_of(epoch))
+            .filter(|entry| entry.finalized_epoch == epoch)
+            .ok_or(ZkasperError::EpochNotInRing)
+    }
+
+    /// The entry some accepted proof named `state_root` in, by a linear pass
+    /// over the ring.
+    ///
+    /// Two epochs cannot share a beacon state root, so at most one slot matches.
+    /// This is what the separate anchor account used to be: a reverse index, at
+    /// the cost of a scan rather than of an address.
+    pub fn entry_by_state_root(
+        data: &[u8],
+        state_root: &[u8; 32],
+    ) -> Result<FinalizationEntry, ZkasperError> {
+        Self::header(data)?;
+        // Compared in place. Unpacking each slot to compare it would copy 72
+        // bytes 128 times and more than doubles what the pass costs.
+        let index = (0..RING_ENTRIES)
+            .find(|index| {
+                let at = Self::offset(*index);
+                data[at + ENT_OFF_TAG] == TAG_RING_ENTRY
+                    && data[at + ENT_OFF_STATE_ROOT..at + ENT_OFF_STATE_ROOT + 32] == *state_root
+            })
+            .ok_or(ZkasperError::StateRootNotAnchored)?;
+        Self::slot(data, index).ok_or(ZkasperError::StateRootNotAnchored)
+    }
+
+    fn header(data: &[u8]) -> Result<(), ZkasperError> {
+        if data.len() < RING_LEN {
             return Err(ZkasperError::AccountDataTooSmall);
         }
-        data[ANC_OFF_TAG] = TAG_ANCHOR_RECORD;
-        data[ANC_OFF_BUMP] = self.bump;
-        data[ANC_OFF_EPOCH..ANC_OFF_EPOCH + 8].copy_from_slice(&self.finalized_epoch.to_le_bytes());
-        data[ANC_OFF_STATE_ROOT..ANC_OFF_STATE_ROOT + 32]
-            .copy_from_slice(&self.finalized_state_root);
+        if data[RING_OFF_TAG] != TAG_FINALIZATION_RING {
+            return Err(ZkasperError::WrongAccountTag);
+        }
         Ok(())
+    }
+
+    /// The slot an epoch owns, and the only place it is ever written or looked
+    /// for.
+    fn index_of(epoch: u64) -> usize {
+        (epoch % RING_ENTRIES as u64) as usize
+    }
+
+    fn offset(index: usize) -> usize {
+        RING_HEADER_LEN + index * RING_ENTRY_LEN
+    }
+
+    /// `None` when nothing has been written to this slot yet.
+    fn slot(data: &[u8], index: usize) -> Option<FinalizationEntry> {
+        let at = Self::offset(index);
+        if data[at + ENT_OFF_TAG] != TAG_RING_ENTRY {
+            return None;
+        }
+        Some(FinalizationEntry {
+            finalized_epoch: u64_at(data, at + ENT_OFF_EPOCH),
+            finalized_root: a32(data, at + ENT_OFF_ROOT),
+            finalized_state_root: a32(data, at + ENT_OFF_STATE_ROOT),
+        })
     }
 }
 
@@ -271,21 +320,86 @@ pub fn light_client_address(program_id: &Pubkey, authority: &Pubkey) -> (Pubkey,
     Pubkey::find_program_address(&[SEED_STATE, authority.as_ref()], program_id)
 }
 
-pub fn finalization_record_address(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    epoch: u64,
-) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[SEED_FINALIZATION, authority.as_ref(), &epoch.to_le_bytes()],
-        program_id,
-    )
+pub fn finalization_ring_address(program_id: &Pubkey, authority: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_RING, authority.as_ref()], program_id)
 }
 
-pub fn anchor_record_address(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    state_root: &[u8; 32],
-) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[SEED_ANCHOR, authority.as_ref(), state_root], program_id)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(epoch: u64) -> FinalizationEntry {
+        FinalizationEntry {
+            finalized_epoch: epoch,
+            finalized_root: [epoch as u8; 32],
+            finalized_state_root: [!(epoch as u8); 32],
+        }
+    }
+
+    fn ring() -> Vec<u8> {
+        let mut data = vec![0u8; RING_LEN];
+        FinalizationRing::init(&mut data, 254).unwrap();
+        data
+    }
+
+    #[test]
+    fn an_entry_round_trips() {
+        let mut data = ring();
+        FinalizationRing::write(&mut data, &entry(469_426)).unwrap();
+        assert_eq!(FinalizationRing::bump(&data), Ok(254));
+        assert_eq!(FinalizationRing::entry(&data, 469_426), Ok(entry(469_426)));
+    }
+
+    /// The check the whole design rests on: the slot an epoch lands in comes
+    /// back 128 epochs later holding someone else.
+    #[test]
+    fn a_wrapped_slot_does_not_answer_for_the_epoch_it_replaced() {
+        let mut data = ring();
+        FinalizationRing::write(&mut data, &entry(1_000)).unwrap();
+        FinalizationRing::write(&mut data, &entry(1_000 + RING_ENTRIES as u64)).unwrap();
+        assert_eq!(
+            FinalizationRing::entry(&data, 1_000),
+            Err(ZkasperError::EpochNotInRing)
+        );
+        assert_eq!(
+            FinalizationRing::entry(&data, 1_000 + RING_ENTRIES as u64),
+            Ok(entry(1_000 + RING_ENTRIES as u64))
+        );
+    }
+
+    /// A zeroed slot reads as epoch 0 with an all-zero root, and must not be
+    /// mistaken for a finalization of it.
+    #[test]
+    fn an_untouched_slot_is_not_a_finalization_of_epoch_zero() {
+        let data = ring();
+        assert_eq!(
+            FinalizationRing::entry(&data, 0),
+            Err(ZkasperError::EpochNotInRing)
+        );
+        assert_eq!(
+            FinalizationRing::entry_by_state_root(&data, &[0u8; 32]),
+            Err(ZkasperError::StateRootNotAnchored)
+        );
+    }
+
+    #[test]
+    fn the_scan_finds_the_state_root_and_the_epoch_that_named_it() {
+        let mut data = ring();
+        for epoch in 1..=RING_ENTRIES as u64 {
+            FinalizationRing::write(&mut data, &entry(epoch)).unwrap();
+        }
+        let wanted = entry(RING_ENTRIES as u64 - 1);
+        assert_eq!(
+            FinalizationRing::entry_by_state_root(&data, &wanted.finalized_state_root),
+            Ok(wanted)
+        );
+        // Every state root written above is a uniform byte, so a root that is
+        // not uniform is one no entry can hold.
+        let mut unknown = [0u8; 32];
+        unknown[0] = 1;
+        assert_eq!(
+            FinalizationRing::entry_by_state_root(&data, &unknown),
+            Err(ZkasperError::StateRootNotAnchored)
+        );
+    }
 }
