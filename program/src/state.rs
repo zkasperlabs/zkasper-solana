@@ -75,13 +75,18 @@ pub struct LightClientState {
     /// a validator-set root and a total active balance and no epoch, so two
     /// epochs that left the set untouched commit to identical bytes and a
     /// skipped epoch would pass. That the set moves every epoch on mainnet is
-    /// an observation about mainnet, not a property of the format.
+    /// an observation about mainnet, not a property of the format; on a chain
+    /// whose set does not move it is the only thing ordering finalizations.
     ///
-    /// Consecutiveness is load-bearing because zkasper proves the supermajority
-    /// vote and the ancestry of the finalized root but never the FFG link, which
-    /// leaves a consumer only Casper's double-vote clause — and that clause
-    /// binds only while every epoch in the sequence carries a supermajority
-    /// vote. See `docs/finality/assumptions.md` in the zkasper repository.
+    /// What consecutiveness buys depends on the guest. Against one that leaves
+    /// the FFG source unconstrained it is safety: a consumer holds only Casper's
+    /// double-vote clause, and that clause binds while every epoch in the
+    /// sequence carries a supermajority vote. Against one that constrains it the
+    /// circuits prove the one-epoch rule, gaps become legitimate, and the
+    /// equality survives for a different reason — the accumulator across a gap
+    /// was produced by an epoch diff no proof this program can verify has ever
+    /// covered, so the chain cannot be walked over it. See
+    /// `docs/finality/assumptions.md` in the zkasper repository.
     ///
     /// Always `finalized_epoch + 1`: bootstrap sets it so, and thereafter it is
     /// the accepted proof's `justified_epoch`, which the guest asserts is its

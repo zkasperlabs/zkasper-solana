@@ -325,9 +325,13 @@ fn rejects_a_finalization_from_a_branched_accumulator() {
 /// cannot be edited into it -- `finalized_epoch` is bound by the public-input
 /// hash, so mutating it fails verification first, with a different error.
 ///
-/// Consecutiveness is the safety property: zkasper never proves the FFG link,
-/// so a consumer holds only the double-vote clause, and that clause binds only
-/// while every epoch in the sequence carries a supermajority vote.
+/// It is also the whole of what relaxing the epoch check would buy. A gap that
+/// is legitimate moves the accumulator and is refused by the check below this
+/// one either way (see `a_gap_is_refused_as_a_gap_and_not_as_a_branch`); the
+/// only gap the relaxation would actually let through is this one, where the
+/// set did not move -- which is every epoch of a chain whose set is static, and
+/// on any chain the shape a jump to a far epoch has to take to get past the
+/// commitment. Relaxing costs sequencing and buys no liveness at all.
 #[test]
 fn rejects_a_finalization_that_skips_an_epoch() {
     let mut h = Harness::new();
@@ -357,6 +361,62 @@ fn rejects_a_finalization_that_skips_an_epoch() {
     let after = h.state();
     assert_eq!(after.finalized_epoch, out.finalized_epoch - 2);
     assert_eq!(after.accumulator_epoch, out.finalized_epoch - 1);
+    assert_eq!(after.submission_count, 0);
+    assert_eq!(
+        FinalizationRing::entry(&h.ring(), out.finalized_epoch),
+        Err(ZkasperError::EpochNotInRing)
+    );
+}
+
+/// A gap this client cannot cross, refused as a gap rather than as a branch.
+///
+/// This is the shape of a legitimate skip once the guests constrain the FFG
+/// source: `finalized_epoch` jumps, because zkasper proves the one-epoch rule
+/// exactly and publishes nothing for an epoch the chain finalized by the
+/// two-epoch rule -- and the accumulator jumped with it, because the epoch that
+/// went unproven still moved the validator set. Both checks would refuse it, and
+/// which one fires is what an operator reads at three in the morning: a branch,
+/// which is an attack that is not happening, or a gap, which is a light client
+/// that has stopped and has to be bootstrapped again above it.
+///
+/// The crossing itself is not a program-side decision. The accumulator on the
+/// far side was produced by an epoch diff that no proof this program can verify
+/// has ever covered, so accepting the jump means taking the submitter's word for
+/// the validator set the next supermajority is measured against.
+#[test]
+fn a_gap_is_refused_as_a_gap_and_not_as_a_branch() {
+    let mut h = Harness::new();
+    let out = h.f.output;
+    let program_vk = h.f.program_vk;
+    // One epoch short of the proof, holding an accumulator of its own: the state
+    // a skipped epoch leaves behind.
+    let mut held = out.accumulator_commitment;
+    held[0] ^= 1;
+    h.ok(&[ix::initialize(
+        &h.program_id,
+        &h.payer.pubkey(),
+        &held,
+        &[0u8; 32],
+        out.finalized_epoch - 2,
+        &[0u8; 32],
+        &program_vk,
+    )]);
+    let before = h.state();
+    // Both refusals are armed, which is what makes the error reported a choice.
+    assert_ne!(before.accumulator_commitment, out.accumulator_commitment);
+    assert_eq!(before.accumulator_epoch, out.finalized_epoch - 1);
+    assert!(out.finalized_epoch > before.finalized_epoch);
+
+    let result = h.submit(&out);
+    custom_error(&result, ZkasperError::AccumulatorEpochMismatch);
+
+    // Stopped, not moved. Nothing this client can ever be sent will advance it
+    // now: the only proof it accepts finalizes the epoch it still holds, and on
+    // the far side of a gap no such proof exists.
+    let after = h.state();
+    assert_eq!(after.accumulator_commitment, before.accumulator_commitment);
+    assert_eq!(after.accumulator_epoch, before.accumulator_epoch);
+    assert_eq!(after.finalized_epoch, before.finalized_epoch);
     assert_eq!(after.submission_count, 0);
     assert_eq!(
         FinalizationRing::entry(&h.ring(), out.finalized_epoch),

@@ -439,6 +439,16 @@ to by `accumulator_commitment` attested to `(finalized_epoch, finalized_root)`
 under Casper FFG, and that `finalized_state_root` is the beacon state root
 opened from that block's header.
 
+How much less that is than *"Ethereum finalized this checkpoint"* depends on the
+guest the client pins, and the difference is the FFG source. A guest that leaves
+the source unconstrained proves a supermajority target vote in each of two
+consecutive epochs plus the ancestry between them, and leaves a consumer Casper's
+double-vote clause alone. A guest that constrains it — every counted attestation
+for the epoch above naming this checkpoint as its source — proves the
+specification's one-epoch rule, which is the supermajority *link*, and the
+surround clause comes with it. `docs/finality/assumptions.md` in the zkasper
+repository holds the exact claim either way.
+
 ### What is trusted, not proved
 
 `initialize` writes a checkpoint nobody proved. Every light client needs a
@@ -496,12 +506,39 @@ keeps the commitment moving, not a property of the format.
 
 So the state also carries `accumulator_epoch`, the epoch its accumulator belongs
 to, and a submission must finalize exactly that epoch or be rejected with
-`AccumulatorEpochMismatch`. This is load-bearing rather than tidy: zkasper proves
-the supermajority target vote and the ancestry of the finalized root, but never
-the FFG link, so a consumer holds only Casper's double-vote clause — and that
-clause binds only while *every* epoch in the sequence carries a supermajority
-vote. One gap and it does not. See `docs/finality/assumptions.md` in the zkasper
-repository.
+`AccumulatorEpochMismatch`. It is checked *before* the commitment, because a
+skipped epoch moves the accumulator too and would otherwise be reported as a
+branch. On a chain whose validator set does not move — a devnet, or any epoch
+that happened to change nothing — it is the only thing ordering finalizations at
+all, since the commitment check is then satisfied by every epoch at once.
+
+**A gap strands this client, and that is a liveness limit rather than a safety
+one.** Against a guest that leaves the FFG source unconstrained, consecutiveness
+is the safety property: a consumer holds only Casper's double-vote clause, which
+binds while *every* epoch in the sequence carries a supermajority vote. Against a
+guest that constrains it, those circuits prove the one-epoch rule exactly, an
+epoch the chain finalized by the two-epoch rule is one no proof of this shape
+exists for, and `finalized_epoch` may legitimately jump. The program refuses the
+jump anyway, and cannot do otherwise: the accumulator on the far side of a gap
+differs from the one held here by an epoch diff that no proof this program can
+verify has ever covered — a finalization verifies the diff between its own two
+epochs and no others — so crossing would mean adopting, on the submitter's word,
+the validator set the next supermajority is measured against. A client that meets
+a gap stops there and has to be bootstrapped again above it. See
+`docs/finality/assumptions.md` in the zkasper repository.
+
+**Closing that is a change to the guest, not to this program.** Two things would
+have to reach the chain, and `StreamFinalOutput` publishes neither: the
+accumulator the proof's walk *started* from together with the epoch that
+accumulator belongs to, with the intervening epoch diffs verified inside the
+circuit, so that the check above stays an equality against the far end of a
+longer walk; and the source checkpoint of the justification the proof consumed,
+so a client can splice the link across the gap onto the checkpoint it already
+holds instead of holding two links with nothing between them. A committed output
+of 208 bytes leaves 48 of the 256 a Zisk proof can publish, which is room for the
+first pair or for one digest binding both. Accepting a bare epoch-diff proof on
+chain instead would need a second pinned key in an account that has no update
+path, and would move the accumulator with no checkpoint attached to it.
 
 Bootstrap is where the two can disagree, and it is the reason to be careful with
 `Initialize`: its `finalized_epoch` is the checkpoint being trusted, while its

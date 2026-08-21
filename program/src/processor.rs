@@ -203,6 +203,44 @@ fn submit_finalization(
         return Err(ZkasperError::EpochNotAdvancing.into());
     }
 
+    // Where the sequence resumes. The client holds one accumulator and the epoch
+    // that accumulator belongs to, and a proof extends it only by finalizing
+    // exactly that epoch.
+    //
+    // A gap here is refused, and the reason has moved. Against a guest that
+    // leaves the FFG source unconstrained, a gap is unsafe to believe: the
+    // consumer holds only Casper's double-vote clause, which bites while every
+    // epoch in the sequence carries a supermajority vote. Against a guest that
+    // constrains it, a gap is legitimate -- those circuits prove the one-epoch
+    // rule exactly, and an epoch the chain finalized by the two-epoch rule is
+    // one no proof of this shape exists for -- and it is refused anyway, because
+    // this program cannot get across one. The accumulator on the far side
+    // differs from the one held here by an epoch diff no proof this program can
+    // verify has ever covered: a finalization verifies the diff between its own
+    // two epochs and no others. Adopting the far side on the submitter's word is
+    // the whole of the root of trust, so the refusal stands under either guest,
+    // and what it costs is liveness rather than safety -- a client that meets a
+    // gap stops there and has to be bootstrapped again above it.
+    //
+    // The commitment check below cannot stand in for this. A commitment binds a
+    // validator-set root and a total active balance and no epoch, so on a chain
+    // whose set does not move -- a devnet, or any epoch that happened to change
+    // nothing -- every epoch commits to the same bytes and this is the only
+    // thing ordering finalizations at all. That no gap has slipped past on
+    // mainnet is an accident of the network, not a guarantee of the format.
+    //
+    // It runs first so the refusal names the right thing: a gap moves the
+    // accumulator too, so the check below would fire on it and report a branch,
+    // which is an attack that is not happening.
+    if state.accumulator_epoch != output.finalized_epoch {
+        msg!(
+            "zkasper: holds epoch {}, finalization starts at {}; a gap is not crossable",
+            state.accumulator_epoch,
+            output.finalized_epoch,
+        );
+        return Err(ZkasperError::AccumulatorEpochMismatch.into());
+    }
+
     // Chain the accumulator strictly. Each finalization names BOTH ends of one
     // proven transition: `accumulator_commitment` is what the finalized epoch
     // was justified against, and `next_accumulator_commitment` is what the
@@ -213,30 +251,14 @@ fn submit_finalization(
     // unbroken: it requires the incoming start to equal the accumulator it holds,
     // and stores the end. A prover who branched the accumulator cannot rejoin,
     // because the branch's commitment will not match what is stored here.
+    // Reached only at the epoch this client holds, so what it refuses is a
+    // branch and never a gap.
     //
     // This replaces the earlier optimistic acceptance, which took any new
     // commitment on trust and left detection to the consumer.
     if state.accumulator_commitment != output.accumulator_commitment {
         msg!("zkasper: finalization starts from an accumulator this client does not hold");
         return Err(ZkasperError::AccumulatorMismatch.into());
-    }
-
-    // Same accumulator, but is it the same *epoch*? A commitment binds a
-    // validator-set root and a total active balance and nothing else, so two
-    // epochs that left the set untouched are byte-identical here and the check
-    // above would wave a skipped epoch through. On mainnet the set moves every
-    // epoch, which is why no gap has slipped past -- an accident of the network,
-    // not a guarantee of the format.
-    //
-    // The gap matters because zkasper proves the supermajority target vote and
-    // the ancestry of the finalized root, never the FFG link. A consumer is left
-    // with Casper's double-vote clause, and that clause only bites while every
-    // epoch in the sequence carries a supermajority vote. So consecutiveness is
-    // the safety property, and it is checked here rather than inferred from the
-    // validator set happening to churn.
-    if state.accumulator_epoch != output.finalized_epoch {
-        msg!("zkasper: finalization does not start at the epoch this client holds");
-        return Err(ZkasperError::AccumulatorEpochMismatch.into());
     }
 
     expect_ring(program_id, ring_info, &authority)?;
