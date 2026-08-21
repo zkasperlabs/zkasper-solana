@@ -32,15 +32,31 @@ pub enum ZkasperError {
     /// be reading a fact that was never asserted.
     EpochNotInRing = 12,
     AccountDataTooSmall = 14,
-    /// The finalization starts from an accumulator this client does not hold.
+    /// The finalization starts from an accumulator this client does not hold,
+    /// at the epoch it does hold.
     ///
     /// Each finalization names both ends of one proven epoch transition, so a
     /// mismatch here means the proof belongs to a different accumulator chain —
     /// a branch. Rejecting is what keeps the chain unbroken without the program
     /// ever seeing an epoch-diff proof.
+    ///
+    /// Checked after [`Self::AccumulatorEpochMismatch`], so it is a branch and
+    /// never a skipped epoch: a gap moves the accumulator too, and reporting one
+    /// as the other sends an operator hunting an attacker who is not there.
     AccumulatorMismatch = 15,
-    /// The accumulator matched, but it is not the accumulator of the epoch this
-    /// finalization claims to start from — the submission skips an epoch.
+    /// The submission does not finalize the epoch this client's accumulator
+    /// belongs to — it skips one, and a gap cannot be crossed.
+    ///
+    /// Against a guest that constrains the FFG source this is not a claim that
+    /// the submission is false. Those circuits prove the specification's
+    /// one-epoch rule exactly, so an epoch the chain finalized by the two-epoch
+    /// rule is simply one no proof of this shape exists for, and
+    /// `finalized_epoch` may legitimately jump. What cannot be done is the
+    /// crossing: the accumulator on the far side differs from the one held here
+    /// by an epoch diff no proof this program can verify has ever covered, and
+    /// adopting it on the submitter's word would hand over the validator set.
+    /// **A client that sees this is stranded rather than under attack, and has
+    /// to be bootstrapped again above the gap.**
     ///
     /// [`Self::AccumulatorMismatch`] cannot catch this on its own: an
     /// accumulator commitment binds the validator-set root and the total active
