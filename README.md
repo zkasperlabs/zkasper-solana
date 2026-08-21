@@ -17,13 +17,16 @@ anywhere in Zisk. The verifier here is a transliteration of the Solidity verifie
 Zisk ships as `zisk-contracts/PlonkVerifier.sol`, with every precompile call
 replaced by the matching syscall.
 
-> **Status: the proof is a mainnet Ethereum epoch, and the program verifies it.**
-> [`fixtures/wrap-469891.json`](fixtures/README.md) is a `wrap --plonk` of a
-> proof `zkasperd` produced in production for mainnet epoch 469891 — finalizing
-> 469890 — and the tests run it through the compiled program. The guest is
-> zkasper's own streaming finalization guest, so what verifies is a claim about
-> Casper FFG and not about a stand-in. Nothing has been submitted to a cluster
-> under this pin; the devnet deployment still runs the previous build.
+> **Status: a mainnet Ethereum epoch, verified by this program on a public
+> cluster.** [`fixtures/wrap-469993.json`](fixtures/README.md) is a
+> `wrap --plonk` of a proof `zkasperd` produced in production for mainnet epoch
+> 469993 — finalizing 469992 — and devnet transaction
+> [`2XYkwk1C…`](https://explorer.solana.com/tx/2XYkwk1CJ1sBZTsxwiQFjcDs1tzE7zMuxBUn4jp7ypprDGczNLbeZqf19Yhu8iLSvRjbckfAFKzUDG3GoaazNkw3?cluster=devnet)
+> is the deployed program verifying it, in 476,789 compute units for a 5,000
+> lamport fee. The guest is zkasper's own streaming finalization guest, and
+> 469992 is the first epoch proved under circuits that constrain the FFG source
+> checkpoint — so what a cluster has now checked is a Casper FFG link, not a
+> stand-in and not a target vote with no source.
 
 ## One transaction
 
@@ -79,18 +82,25 @@ membership.
 
 ## Measured cost
 
-A submission costs **477,279 compute units**, which does **not** fit Solana's
+A submission costs **476,789 compute units**, which does **not** fit Solana's
 200,000-unit default: every submitter must raise the limit with
 `ComputeBudgetProgram`. 700,000 is the value the CLI asks for.
 
 | Path | Compute units |
 | --- | --- |
-| `submit_finalization` — decompress, verify, advance state, write one ring entry | **477,279** |
-| `verify_only` — decompression and PLONK verification alone | 473,222 |
+| `submit_finalization` — decompress, verify, advance state, write one ring entry | **476,789** |
+| `verify_only` — decompression and PLONK verification alone | 472,724 |
 | `assert_finalized` — index the ring by epoch, on a full ring | 2,412 |
 | `assert_anchored` — a pass over all 128 entries, no match | 3,181 |
 | `assert_anchored` — the same, matching in the last slot reached | 3,337 |
-| `initialize` — trusted bootstrap, and the ring's one allocation | 12,288 |
+| `initialize` — trusted bootstrap, and the ring's one allocation | 15,288 |
+
+These are the numbers for the fixture in the tree, and verification is not quite
+a constant: the `Fr` inversion in `lagrange_1` is software extended-Euclid, whose
+iteration count depends on its input, and that input descends from the
+Fiat-Shamir challenge `xi` — a hash of the proof. Swapping one real wrap for
+another moved `verify_only` by 498 units. It is noise against a 700,000-unit
+budget, and it is why a submitter should size that budget rather than pin it.
 
 Verifying under v1.1.0-alpha costs **692 units more** than under v1.0.0-alpha,
 and all of it is the public window: the SHA-256 preimage went from 320 bytes to
@@ -649,18 +659,16 @@ keypair. A real deployment generates its own, keeps it private, and updates
 
 ```sh
 ZKASPER_POSTINGS=/var/lib/zkasper/postings.jsonl \
-  zkasper-cli https://api.devnet.solana.com payer.json submit fixtures/wrap-469891.json
+  zkasper-cli https://api.devnet.solana.com payer.json submit fixtures/wrap-469993.json
 ```
 
-The record below is the one the devnet submission of the previous fixture
-produced, kept because it is a real receipt rather than a sketch. Nothing has
-been submitted under the v1.1.0-alpha pin, so the epoch and the compute units are
-that submission's:
+The record below is the one this repository's own devnet submission produced,
+abbreviated only in the hex fields:
 
 ```json
-{"chain":"solana-devnet","cluster":"devnet","epoch":469425,"signature":"4Jr…","slot":11,
- "compute_units":476437,"fee_lamports":5000,"rent_lamports":0,"lamports_spent":5000,
- "status":"confirmed","explorer":"https://explorer.solana.com/tx/4Jr…?cluster=devnet","…":""}
+{"chain":"solana-devnet","cluster":"devnet","epoch":469992,"signature":"2XYkwk1C…","slot":486134401,
+ "compute_units":476789,"fee_lamports":5000,"rent_lamports":0,"lamports_spent":5000,
+ "status":"confirmed","explorer":"https://explorer.solana.com/tx/2XYkwk1C…?cluster=devnet","…":""}
 ```
 
 `rent_lamports` is zero for every submission after the bootstrap, and the field

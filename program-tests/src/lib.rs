@@ -1,6 +1,6 @@
 //! The wrapped zkasper proof of a mainnet epoch, parsed.
 //!
-//! `fixtures/wrap-469891.json` is the output of `cargo-zisk wrap --plonk` on
+//! `fixtures/wrap-469993.json` is the output of `cargo-zisk wrap --plonk` on
 //! Zisk v1.1.0-alpha. See `fixtures/README.md` for what it is a proof *of*.
 
 use zkasper_solana_program::plonk::vk::{PUBLIC_VALUES_LEN, ROOT_C_VADCOP_FINAL};
@@ -21,7 +21,7 @@ pub struct Fixture {
 }
 
 pub fn fixture() -> Fixture {
-    let raw = include_str!("../../fixtures/wrap-469891.json");
+    let raw = include_str!("../../fixtures/wrap-469993.json");
     let field = |name: &str| -> Vec<u8> {
         let at = raw.find(name).expect("field") + name.len();
         let rest = &raw[at..];

@@ -5,7 +5,7 @@ a local-development keypair and nothing else: anyone can deploy a program at thi
 address on any cluster where it is still free.
 
 **It no longer matches `declare_id!`.** As of 2026-08-20 the program declares
-`2yXFbgLjFk7e5nyfdv5CSEEmpqEPbxLgrvNhxANYbTMn`, deployed on devnet, whose keypair
+`DNDHd2Rp2JyDy7ENtuYLnDirUxtLRyWowsJMd4CppWkn`, deployed on devnet, whose keypair
 is held outside this repository and is not public. The old address
 `Cuarryex9DFpVm6HNdCFvpS3EEeArSuTXDMNTk9hpKja` was deployed to devnet and then
 closed to reclaim its rent, so it can never be deployed to again.

@@ -42,7 +42,7 @@ fn the_public_input_matches_the_wrap() {
                 .into_bigint()
                 .to_bytes_be()
         ),
-        "1ff2741cc9d9d642ef0507c1939c7c1da13dca625d7d00ceda84343b9dcc7476",
+        "278f1ea229b7852480503e0052425c036a2819e319400816612e076027bb7615",
     );
 }
 
