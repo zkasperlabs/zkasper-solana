@@ -260,7 +260,7 @@ fn main() {
             let path = args
                 .get(3)
                 .map(String::as_str)
-                .unwrap_or("fixtures/wrap-469891.json");
+                .unwrap_or("fixtures/wrap-469993.json");
             let wrap = read_wrap(path);
             // Bootstrap one epoch below the proof, on the accumulator it starts
             // from, so the demo has something the proof can advance. A real
@@ -283,7 +283,7 @@ fn main() {
             let path = args
                 .get(3)
                 .map(String::as_str)
-                .unwrap_or("fixtures/wrap-469891.json");
+                .unwrap_or("fixtures/wrap-469993.json");
             let wrap = read_wrap(path);
             println!("submitting epoch {}", wrap.output.finalized_epoch);
             let signature = send(

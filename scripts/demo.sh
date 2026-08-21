@@ -58,7 +58,7 @@ cli() { cargo run --quiet --release -p zkasper-cli -- "$RPC_URL" "$KEYPAIR" "$@"
 step "addresses"
 cli address
 
-WRAP=fixtures/wrap-469891.json
+WRAP=fixtures/wrap-469993.json
 
 step "bootstrap (trusted, unproved)"
 cli init "$WRAP"

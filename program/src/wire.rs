@@ -42,7 +42,7 @@ pub const FINALIZATION_PUBLIC_BYTES: usize = 32 + 32 + 8 + 32 + 32 + 8 + 32;
 /// proof whose guest committed any other key produces a different digest and
 /// fails. The submitter never gets to name it, which is the whole point.
 ///
-/// It is `true` since `fixtures/wrap-469891.json`, whose guest is a production
+/// It is `true` since `fixtures/wrap-469993.json`, whose guest is a production
 /// zkasperd from after that commit: slots 44..52 of its public window hold the
 /// key its own proof was produced under. A proof from a guest that predates the
 /// field no longer verifies here, which is the same statement as the release

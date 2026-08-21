@@ -1,38 +1,46 @@
 # Fixtures
 
-`wrap-469891.json` is a real `cargo-zisk wrap --plonk` output: a 768-byte BN254
+`wrap-469993.json` is a real `cargo-zisk wrap --plonk` output: a 768-byte BN254
 PLONK proof, the 512-byte public window it commits to, the guest key it was
 produced under, and the `rootCVadcopFinal` of the Zisk release that made it. The
 tests verify it — off chain in `program-tests/tests/plonk.rs`, and through the
 compiled SBF program in `program-tests/tests/verifier.rs`.
 
-**It is a proof of Ethereum finality.** The guest is zkasper's own streaming
-finalization guest, the one `zkasperd` runs on the latency path, and the input is
-the proof it published for mainnet epoch 469891:
+**It is a proof of Ethereum finality, and of the FFG link.** The guest is
+zkasper's own streaming finalization guest, the one `zkasperd` runs on the
+latency path, and the input is the proof it published for mainnet epoch 469993:
 
 | | |
 | --- | --- |
-| `finalized_epoch` | 469890 |
-| `finalized_root` | `0xd965c51241e51953002a436c19ed39bb37976e31c81a2dcf71b336dc8a846039` |
-| `finalized_state_root` | `0x3791b4c98355df256ed996dc8030861518b98e2d25550fc7c73d376a4175abb8` |
-| `justified_epoch` | 469891 |
-| `justified_root` | `0x3eb6205db5239157d4821aabb740ace59778188315d766e79f908f93382a4fdb` |
+| `finalized_epoch` | 469992 |
+| `finalized_root` | `0x39b6f3806980980dd240e48a93917287a705f29b43a3bb95b671234c45276277` |
+| `finalized_state_root` | `0x4676dc1d2a6223ce401ec6c53fd3984dd70a7bd56a5e86f2e2481356c9898079` |
+| `justified_epoch` | 469993 |
+| `justified_root` | `0x5229c63280ef5ec0c0ff42d3fcb1208e6a7d97522e1fa541964325569dd36a63` |
 
-So the claim the program checks is the real one: that a Casper FFG checkpoint was
-finalized by a supermajority of the full validator set. What is *not* exercised
-here is whether zkasper's circuits prove that soundly. That question lives in the
-zkasper repository.
+469992 is the first epoch zkasper proved under circuits that **constrain the FFG
+source checkpoint** (`constrain the ffg source checkpoint`, 2026-08-21). Before
+that the circuits proved a supermajority attesting to a target without binding
+the source the vote started from, so what they established was not yet a Casper
+FFG link. This fixture is on the far side of that change, and the guest key
+below is the key those circuits produce — a different guest from the one every
+earlier fixture carried, which is why a light client bootstrapped against an
+older key rejects this proof.
+
+What is *not* exercised here is whether zkasper's circuits prove that soundly.
+That question lives in the zkasper repository.
 
 ## Provenance
 
-The input is `stream_final_proof.bin` of `epoch-000469891` from a production
+The input is `stream_final_proof.bin` of `epoch-000469993` from a production
 `zkasperd` run — 369,232 bytes, `minimal = 0`, 69 STARK publics. The wrap was
-produced on 2026-08-20 on a rented card, on CPU, against the v1.1.0-alpha SNARK
-proving key (`provingKeySnark`, the 2026-08-19 build) whose
+produced on 2026-08-21 on a rented card, on CPU in 333 s, against the
+v1.1.0-alpha SNARK proving key (`provingKeySnark`, the 2026-08-19 build) whose
 `vadcop_final.verkey.json` is the 2026-08-17 value production proves under.
 
 It took two upstream corrections, both recorded in
-`/mnt/ssd/zkasper-wrap-469891/PROVENANCE.md` beside the artifacts:
+`/mnt/ssd/zkasper-wrap-469993/` beside the artifacts and explained at length in
+`/mnt/ssd/zkasper-wrap-469891/PROVENANCE.md`:
 
 * `backend.plonk()` passes the guest program VK as proofman's `verkey_override`,
   where a plain vadcop_final leaf needs the vadcop_final verkey. Stock
@@ -51,10 +59,18 @@ It took two upstream corrections, both recorded in
 | `proofBytes` | 768 | `uint256[24]` |
 
 The single public input those hash to is
-`0x1ff2741cc9d9d642ef0507c1939c7c1da13dca625d7d00ceda84343b9dcc7476`, and
+`0x278f1ea229b7852480503e0052425c036a2819e319400816612e076027bb7615`, and
 `the_public_input_matches_the_wrap` checks the program derives exactly that.
 
-## The fixture that used to be here
+## The fixtures that used to be here
+
+`wrap-469891.json` was the same kind of artifact as this one and verified under
+the same pin: a v1.1.0-alpha wrap of a production mainnet proof, for epoch
+469891. It is gone because its guest predates the FFG source constraint, so the
+claim it carries is the weaker one, and a repository that shipped both would be
+offering a reader two proofs that look alike and are not. It is in git history,
+with the provenance it had, and its artifacts remain at
+`/mnt/ssd/zkasper-wrap-469891/`.
 
 `wrap-469426.json` was a v1.0.0-alpha wrap of a stand-in guest whose whole body
 was `commit_slice(read_slice())`. It is gone rather than kept as a regression
@@ -65,6 +81,12 @@ code path can reach would only invite the reading that it still verifies. It is
 in git history at `6eac515`, with the provenance it had.
 
 ## Replacing it
+
+`scripts/wrap_to_fixture.py` turns a `cargo-zisk wrap --plonk` output into those
+four fields; it reproduces this file byte for byte from
+`/mnt/ssd/zkasper-wrap-469993/out-F-rootc-fixed.bin`. The single public input
+changes with the proof, so `the_public_input_matches_the_wrap` has to be given
+the new one.
 
 A real proof drops in as the same four fields — no code change, as long as the
 Zisk release matches `program/src/plonk/vk.rs` and the guest matches whatever
